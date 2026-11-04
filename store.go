@@ -35,6 +35,23 @@ type preflightInfo struct {
 	UsedAt    *time.Time
 }
 
+// postFilter is the community feed query the handlers can express; both stores read it the same
+// way. Sort is "new" or "top", and Number is already a canonical +62 E.164 value.
+type postFilter struct {
+	Sort     string
+	Category string
+	Number   string
+	Limit    int
+	Offset   int
+}
+
+// communityPostColumns is shared so a feed row and a detail row never disagree about which
+// fields the browser is allowed to see. author_user_id is deliberately absent: only the alias
+// leaves this service. status is read because the handlers refuse anything a moderator took
+// down, and it is always "active" by the time a row reaches the browser.
+const communityPostColumns = "id,number_e164,category,title,body,evidence_url,author_alias,up_count,down_count,score,comment_count,created_at,status"
+const communityCommentColumns = "id,post_id,parent_id,body,author_alias,created_at"
+
 type dataStore interface {
 	InsertScan(ctx context.Context, row map[string]any) error
 	PatchScan(ctx context.Context, scanID string, fields map[string]any) error
@@ -44,6 +61,16 @@ type dataStore interface {
 
 	InsertPhoneReport(ctx context.Context, row map[string]any) error
 	PhoneReportExists(ctx context.Context, userID, numberE164 string) (bool, error)
+
+	InsertCommunityPost(ctx context.Context, row map[string]any) error
+	ListCommunityPosts(ctx context.Context, filter postFilter) ([]map[string]any, error)
+	GetCommunityPost(ctx context.Context, postID string) (map[string]any, bool, error)
+	CastCommunityVote(ctx context.Context, postID, userID string, value int) (map[string]any, bool, error)
+	CommunityVotesBy(ctx context.Context, userID string, postIDs []string) (map[string]int, error)
+	InsertCommunityComment(ctx context.Context, row map[string]any) error
+	GetCommunityComment(ctx context.Context, postID, commentID string) (map[string]any, bool, error)
+	ListCommunityComments(ctx context.Context, postID string, limit, offset int) ([]map[string]any, error)
+	DangerousNumbers(ctx context.Context, limit, offset int) ([]map[string]any, error)
 
 	GetSession(ctx context.Context, userID, sessionID string) (*sessionInfo, bool, error)
 	TouchSession(ctx context.Context, userID, sessionID string, at time.Time) error
@@ -141,6 +168,123 @@ func (r *restStore) PhoneReportExists(ctx context.Context, userID, numberE164 st
 		return false, err
 	}
 	return len(rows) > 0, nil
+}
+
+func (r *restStore) InsertCommunityPost(ctx context.Context, row map[string]any) error {
+	return r.call(ctx, "POST", "/rest/v1/community_posts", row, nil)
+}
+
+// ListCommunityPosts orders inside the database. "top" sorts on the stored generated column
+// score, because PostgREST only accepts column names in order=, never an expression.
+func (r *restStore) ListCommunityPosts(ctx context.Context, filter postFilter) ([]map[string]any, error) {
+	order := "created_at.desc"
+	if filter.Sort == "top" {
+		order = "score.desc,created_at.desc"
+	}
+	path := "/rest/v1/community_posts?select=" + communityPostColumns + "&status=eq.active&order=" + order
+	if filter.Category != "" {
+		path += "&category=eq." + url.QueryEscape(filter.Category)
+	}
+	if filter.Number != "" {
+		path += "&number_e164=eq." + url.QueryEscape(filter.Number)
+	}
+	path += fmt.Sprintf("&limit=%d&offset=%d", filter.Limit, filter.Offset)
+	var rows []map[string]any
+	if err := r.call(ctx, "GET", path, nil, &rows); err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
+func (r *restStore) GetCommunityPost(ctx context.Context, postID string) (map[string]any, bool, error) {
+	path := "/rest/v1/community_posts?select=" + communityPostColumns + "&id=eq." + url.QueryEscape(postID) + "&limit=1"
+	var rows []map[string]any
+	if err := r.call(ctx, "GET", path, nil, &rows); err != nil {
+		return nil, false, err
+	}
+	if len(rows) == 0 {
+		return nil, false, nil
+	}
+	return rows[0], true, nil
+}
+
+// CastCommunityVote runs the one-statement RPC: an upsert keyed on (post_id, user_id) cannot be
+// expressed over REST without a transaction, and two clicks arriving together would otherwise be
+// able to write two rows.
+func (r *restStore) CastCommunityVote(ctx context.Context, postID, userID string, value int) (map[string]any, bool, error) {
+	var rows []map[string]any
+	body := map[string]any{"p_post_id": postID, "p_user_id": userID, "p_value": value}
+	if err := r.call(ctx, "POST", "/rest/v1/rpc/cast_vote", body, &rows); err != nil {
+		return nil, false, err
+	}
+	if len(rows) == 0 {
+		return nil, false, nil
+	}
+	return rows[0], true, nil
+}
+
+func (r *restStore) CommunityVotesBy(ctx context.Context, userID string, postIDs []string) (map[string]int, error) {
+	votes := map[string]int{}
+	if len(postIDs) == 0 {
+		return votes, nil
+	}
+	quoted := make([]string, 0, len(postIDs))
+	for _, id := range postIDs {
+		quoted = append(quoted, "%22"+url.QueryEscape(id)+"%22")
+	}
+	path := "/rest/v1/community_votes?select=post_id,value&user_id=eq." + url.QueryEscape(userID) +
+		"&post_id=in.(" + strings.Join(quoted, ",") + ")"
+	var rows []struct {
+		PostID string `json:"post_id"`
+		Value  int    `json:"value"`
+	}
+	if err := r.call(ctx, "GET", path, nil, &rows); err != nil {
+		return nil, err
+	}
+	for _, row := range rows {
+		votes[row.PostID] = row.Value
+	}
+	return votes, nil
+}
+
+func (r *restStore) InsertCommunityComment(ctx context.Context, row map[string]any) error {
+	return r.call(ctx, "POST", "/rest/v1/community_comments", row, nil)
+}
+
+// GetCommunityComment is the reply guard: the caller has to prove the parent lives in this post,
+// is still active, and is itself a top-level comment.
+func (r *restStore) GetCommunityComment(ctx context.Context, postID, commentID string) (map[string]any, bool, error) {
+	path := "/rest/v1/community_comments?select=" + communityCommentColumns +
+		"&id=eq." + url.QueryEscape(commentID) + "&post_id=eq." + url.QueryEscape(postID) + "&status=eq.active&limit=1"
+	var rows []map[string]any
+	if err := r.call(ctx, "GET", path, nil, &rows); err != nil {
+		return nil, false, err
+	}
+	if len(rows) == 0 {
+		return nil, false, nil
+	}
+	return rows[0], true, nil
+}
+
+func (r *restStore) ListCommunityComments(ctx context.Context, postID string, limit, offset int) ([]map[string]any, error) {
+	path := "/rest/v1/community_comments?select=" + communityCommentColumns +
+		"&post_id=eq." + url.QueryEscape(postID) + "&status=eq.active" +
+		"&order=created_at.asc" + fmt.Sprintf("&limit=%d&offset=%d", limit, offset)
+	var rows []map[string]any
+	if err := r.call(ctx, "GET", path, nil, &rows); err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
+func (r *restStore) DangerousNumbers(ctx context.Context, limit, offset int) ([]map[string]any, error) {
+	path := "/rest/v1/dangerous_numbers?select=*&order=verified_reports.desc,last_report_at.desc" +
+		fmt.Sprintf("&limit=%d&offset=%d", limit, offset)
+	var rows []map[string]any
+	if err := r.call(ctx, "GET", path, nil, &rows); err != nil {
+		return nil, err
+	}
+	return rows, nil
 }
 
 func (r *restStore) GetSession(ctx context.Context, userID, sessionID string) (*sessionInfo, bool, error) {
@@ -395,21 +539,25 @@ func (p *pgxStore) InsertFile(ctx context.Context, row map[string]any) error {
 }
 
 func (p *pgxStore) InsertPhoneReport(ctx context.Context, row map[string]any) error {
-	// The note column is additive (migration 0005); reports never depend on it, so a database
-	// that has not applied it yet still accepts the report through the shorter statement.
-	if str(row["note"]) != "" {
-		_, err := p.pool.Exec(ctx,
-			`insert into public.phone_reports (number_e164, category, source, reported_by, status, note)
-			 values ($1, $2, $3, $4::uuid, $5, $6)`,
-			str(row["number_e164"]), str(row["category"]), str(row["source"]),
-			nullableString(row["reported_by"]), str(row["status"]), str(row["note"]))
-		return err
-	}
-	_, err := p.pool.Exec(ctx,
-		`insert into public.phone_reports (number_e164, category, source, reported_by, status)
-		 values ($1, $2, $3, $4::uuid, $5)`,
+	// Optional columns are only named when they carry a value, so a database that has not applied
+	// a later migration still accepts the reports that do not use it. The handler decides which
+	// of them it can live without: the note may be dropped, the evidence may not.
+	columns := []string{"number_e164", "category", "source", "reported_by", "status"}
+	values := []any{
 		str(row["number_e164"]), str(row["category"]), str(row["source"]),
-		nullableString(row["reported_by"]), str(row["status"]))
+		nullableString(row["reported_by"]), str(row["status"]),
+	}
+	placeholders := []string{"$1", "$2", "$3", "$4::uuid", "$5"}
+	for _, key := range []string{"note", "evidence_url", "evidence_public_id"} {
+		if str(row[key]) != "" {
+			columns = append(columns, key)
+			values = append(values, str(row[key]))
+			placeholders = append(placeholders, fmt.Sprintf("$%d", len(values)))
+		}
+	}
+	_, err := p.pool.Exec(ctx, fmt.Sprintf(
+		"insert into public.phone_reports (%s) values (%s)",
+		strings.Join(columns, ", "), strings.Join(placeholders, ", ")), values...)
 	return err
 }
 
@@ -419,6 +567,235 @@ func (p *pgxStore) PhoneReportExists(ctx context.Context, userID, numberE164 str
 		`select exists (select 1 from public.phone_reports where reported_by = $1::uuid and number_e164 = $2)`,
 		userID, numberE164).Scan(&found)
 	return found, err
+}
+
+func (p *pgxStore) InsertCommunityPost(ctx context.Context, row map[string]any) error {
+	// score is a generated column: naming it in an insert is an error, so it is left out here
+	// and read back from the database.
+	_, err := p.pool.Exec(ctx,
+		`insert into public.community_posts
+		 (id, number_e164, category, title, body, evidence_url, evidence_public_id, author_user_id, author_alias, status)
+		 values ($1::uuid, $2, $3, $4, $5, $6, $7, $8::uuid, $9, $10)`,
+		str(row["id"]), str(row["number_e164"]), str(row["category"]), str(row["title"]), str(row["body"]),
+		str(row["evidence_url"]), str(row["evidence_public_id"]), str(row["author_user_id"]),
+		str(row["author_alias"]), str(row["status"]))
+	return err
+}
+
+func (p *pgxStore) ListCommunityPosts(ctx context.Context, filter postFilter) ([]map[string]any, error) {
+	args := []any{filter.Limit, filter.Offset}
+	sql := `select id, number_e164, category, title, body, evidence_url, author_alias,
+	               up_count, down_count, score, comment_count, created_at, status
+	          from public.community_posts
+	         where status = 'active'`
+	if filter.Category != "" {
+		args = append(args, filter.Category)
+		sql += fmt.Sprintf(" and category = $%d", len(args))
+	}
+	if filter.Number != "" {
+		args = append(args, filter.Number)
+		sql += fmt.Sprintf(" and number_e164 = $%d", len(args))
+	}
+	if filter.Sort == "top" {
+		sql += " order by score desc, created_at desc"
+	} else {
+		sql += " order by created_at desc"
+	}
+	sql += " limit $1 offset $2"
+	rows, err := p.pool.Query(ctx, sql, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := make([]map[string]any, 0, filter.Limit)
+	for rows.Next() {
+		var row postFields
+		if err := rows.Scan(&row.id, &row.number, &row.category, &row.title, &row.body, &row.evidence, &row.alias,
+			&row.up, &row.down, &row.score, &row.comments, &row.createdAt, &row.state); err != nil {
+			return nil, err
+		}
+		result = append(result, postRecord(row))
+	}
+	return result, rows.Err()
+}
+
+func (p *pgxStore) GetCommunityPost(ctx context.Context, postID string) (map[string]any, bool, error) {
+	var row postFields
+	err := p.pool.QueryRow(ctx,
+		`select id, number_e164, category, title, body, evidence_url, author_alias,
+		        up_count, down_count, score, comment_count, created_at, status
+		   from public.community_posts where id = $1::uuid`, postID).
+		Scan(&row.id, &row.number, &row.category, &row.title, &row.body, &row.evidence, &row.alias,
+			&row.up, &row.down, &row.score, &row.comments, &row.createdAt, &row.state)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	return postRecord(row), true, nil
+}
+
+func (p *pgxStore) CastCommunityVote(ctx context.Context, postID, userID string, value int) (map[string]any, bool, error) {
+	var up, down, mine int
+	err := p.pool.QueryRow(ctx,
+		`select up_count, down_count, my_vote from public.cast_vote($1::uuid, $2::uuid, $3)`,
+		postID, userID, value).Scan(&up, &down, &mine)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	return map[string]any{"up_count": up, "down_count": down, "my_vote": mine}, true, nil
+}
+
+func (p *pgxStore) CommunityVotesBy(ctx context.Context, userID string, postIDs []string) (map[string]int, error) {
+	votes := map[string]int{}
+	if len(postIDs) == 0 {
+		return votes, nil
+	}
+	args := []any{userID}
+	marks := make([]string, 0, len(postIDs))
+	for _, id := range postIDs {
+		args = append(args, id)
+		marks = append(marks, fmt.Sprintf("$%d::uuid", len(args)))
+	}
+	rows, err := p.pool.Query(ctx,
+		fmt.Sprintf(`select post_id, value from public.community_votes
+		              where user_id = $1::uuid and post_id in (%s)`, strings.Join(marks, ", ")), args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var postID string
+		var value int
+		if err := rows.Scan(&postID, &value); err != nil {
+			return nil, err
+		}
+		votes[postID] = value
+	}
+	return votes, rows.Err()
+}
+
+func (p *pgxStore) InsertCommunityComment(ctx context.Context, row map[string]any) error {
+	_, err := p.pool.Exec(ctx,
+		`insert into public.community_comments (id, post_id, parent_id, body, author_user_id, author_alias, status)
+		 values ($1::uuid, $2::uuid, $3::uuid, $4, $5::uuid, $6, $7)`,
+		str(row["id"]), str(row["post_id"]), nullableString(row["parent_id"]), str(row["body"]),
+		str(row["author_user_id"]), str(row["author_alias"]), str(row["status"]))
+	return err
+}
+
+func (p *pgxStore) GetCommunityComment(ctx context.Context, postID, commentID string) (map[string]any, bool, error) {
+	var (
+		id, body, alias string
+		parentID        *string
+		createdAt       time.Time
+	)
+	err := p.pool.QueryRow(ctx,
+		`select id, post_id, parent_id, body, author_alias, created_at
+		   from public.community_comments
+		  where id = $1::uuid and post_id = $2::uuid and status = 'active'`, commentID, postID).
+		Scan(&id, &postID, &parentID, &body, &alias, &createdAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	return commentRecord(id, postID, parentID, body, alias, createdAt), true, nil
+}
+
+func (p *pgxStore) ListCommunityComments(ctx context.Context, postID string, limit, offset int) ([]map[string]any, error) {
+	rows, err := p.pool.Query(ctx,
+		`select id, post_id, parent_id, body, author_alias, created_at
+		   from public.community_comments
+		  where post_id = $1::uuid and status = 'active'
+		  order by created_at asc limit $2 offset $3`, postID, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := make([]map[string]any, 0, limit)
+	for rows.Next() {
+		var (
+			id, related, body, alias string
+			parentID                 *string
+			createdAt                time.Time
+		)
+		if err := rows.Scan(&id, &related, &parentID, &body, &alias, &createdAt); err != nil {
+			return nil, err
+		}
+		result = append(result, commentRecord(id, related, parentID, body, alias, createdAt))
+	}
+	return result, rows.Err()
+}
+
+func (p *pgxStore) DangerousNumbers(ctx context.Context, limit, offset int) ([]map[string]any, error) {
+	rows, err := p.pool.Query(ctx,
+		`select number_e164, verified_reports, verified_reporters, total_reports, last_report_at,
+		        community_posts, community_score
+		   from public.dangerous_numbers
+		  order by verified_reports desc, last_report_at desc limit $1 offset $2`, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := make([]map[string]any, 0, limit)
+	for rows.Next() {
+		var (
+			number                                   string
+			verified, reporters, total, posts, score int
+			lastReportAt                             *time.Time
+		)
+		if err := rows.Scan(&number, &verified, &reporters, &total, &lastReportAt, &posts, &score); err != nil {
+			return nil, err
+		}
+		record := map[string]any{
+			"number_e164": number, "verified_reports": verified, "verified_reporters": reporters,
+			"total_reports": total, "community_posts": posts, "community_score": score,
+		}
+		if lastReportAt != nil {
+			record["last_report_at"] = moment(*lastReportAt)
+		}
+		result = append(result, record)
+	}
+	return result, rows.Err()
+}
+
+// moment keeps the two stores producing the same JSON: PostgREST already hands back timestamp
+// strings, so the direct-database path formats them the same way instead of shipping Go's own.
+func moment(value time.Time) string {
+	return value.UTC().Format(time.RFC3339)
+}
+
+// postFields is one scanned community_posts row; postRecord gives it the same JSON shape the
+// PostgREST path returns, so the handlers never learn which store answered.
+type postFields struct {
+	id, number, category, title, body, evidence, alias, state string
+	up, down, score, comments                                 int
+	createdAt                                                 time.Time
+}
+
+func postRecord(row postFields) map[string]any {
+	return map[string]any{
+		"id": row.id, "number_e164": row.number, "category": row.category, "title": row.title,
+		"body": row.body, "evidence_url": row.evidence, "author_alias": row.alias,
+		"up_count": row.up, "down_count": row.down, "score": row.score,
+		"comment_count": row.comments, "created_at": moment(row.createdAt), "status": row.state,
+	}
+}
+
+func commentRecord(id, postID string, parentID *string, body, alias string, createdAt time.Time) map[string]any {
+	record := map[string]any{
+		"id": id, "post_id": postID, "body": body, "author_alias": alias, "created_at": moment(createdAt),
+	}
+	if parentID != nil {
+		record["parent_id"] = *parentID
+	}
+	return record
 }
 
 func (p *pgxStore) GetSession(ctx context.Context, userID, sessionID string) (*sessionInfo, bool, error) {

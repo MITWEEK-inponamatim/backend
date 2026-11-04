@@ -37,9 +37,10 @@ type config struct {
 	jwtSecret, databaseURL                       string
 	turnstileSecret, expectedHost, origins       string
 	idleSeconds, absoluteSeconds, maxUploadMB    int
-	maxImageMB                                   int
 	scanPollSeconds, scanTimeoutSeconds          int
 	scanAPKTimeoutSeconds                        int
+	scanLimitMinute, scanLimitHour               int
+	fileScanLimitHour                            int
 }
 
 func loadConfig() config {
@@ -53,9 +54,11 @@ func loadConfig() config {
 		turnstileSecret: os.Getenv("TURNSTILE_SECRET_KEY"), expectedHost: os.Getenv("TURNSTILE_EXPECTED_HOSTNAME"),
 		origins: env("ALLOWED_ORIGINS", "http://localhost:3000"), idleSeconds: envInt("IDLE_TIMEOUT_SECONDS", 3600),
 		absoluteSeconds: envInt("ABSOLUTE_SESSION_SECONDS", 86400), maxUploadMB: envInt("MAX_UPLOAD_MB", 50),
-		maxImageMB:      envInt("MAX_IMAGE_MB", 15),
 		scanPollSeconds: envInt("SCAN_POLL_INTERVAL_SECONDS", 2), scanTimeoutSeconds: envInt("SCAN_TIMEOUT_SECONDS", 120),
 		scanAPKTimeoutSeconds: envInt("SCAN_APPLICATION_TIMEOUT_SECONDS", 180),
+		scanLimitMinute:       envInt("SCAN_LIMIT_PER_MINUTE", 6),
+		scanLimitHour:         envInt("SCAN_LIMIT_PER_HOUR", 40),
+		fileScanLimitHour:     envInt("FILE_SCAN_LIMIT_PER_HOUR", 12),
 	}
 }
 
@@ -139,14 +142,18 @@ func main() {
 	mux.Handle("POST /api/v1/auth/session/heartbeat", s.authenticated(http.HandlerFunc(s.heartbeat)))
 	mux.Handle("POST /api/v1/auth/logout", s.authenticated(http.HandlerFunc(s.logout)))
 	mux.Handle("GET /api/v1/me", s.authenticated(http.HandlerFunc(s.me)))
-	mux.Handle("POST /api/v1/scans/url", s.authenticated(http.HandlerFunc(s.createTextScan("url"))))
-	mux.Handle("POST /api/v1/scans/message", s.authenticated(http.HandlerFunc(s.createTextScan("message"))))
-	mux.Handle("POST /api/v1/scans/phone", s.authenticated(http.HandlerFunc(s.createTextScan("phone"))))
-	mux.Handle("POST /api/v1/scans/image", s.authenticated(http.HandlerFunc(s.createFileScan("image"))))
-	mux.Handle("POST /api/v1/scans/application", s.authenticated(http.HandlerFunc(s.createFileScan("application"))))
+	mux.Handle("POST /api/v1/scans/url", s.authenticated(s.scanRateLimit(false, http.HandlerFunc(s.createTextScan("url")))))
+	mux.Handle("POST /api/v1/scans/phone", s.authenticated(s.scanRateLimit(false, http.HandlerFunc(s.createTextScan("phone")))))
+	mux.Handle("POST /api/v1/scans/application", s.authenticated(s.scanRateLimit(true, http.HandlerFunc(s.createFileScan("application")))))
 	mux.Handle("GET /api/v1/scans", s.authenticated(http.HandlerFunc(s.listScans)))
 	mux.Handle("GET /api/v1/scans/{scanID}", s.authenticated(http.HandlerFunc(s.getScan)))
 	mux.Handle("POST /api/v1/phone-reports", s.authenticated(http.HandlerFunc(s.createPhoneReport)))
+	mux.Handle("POST /api/v1/community/posts", s.authenticated(http.HandlerFunc(s.createCommunityPost)))
+	mux.Handle("GET /api/v1/community/posts", s.authenticated(http.HandlerFunc(s.listCommunityPosts)))
+	mux.Handle("GET /api/v1/community/posts/{postID}", s.authenticated(http.HandlerFunc(s.getCommunityPost)))
+	mux.Handle("POST /api/v1/community/posts/{postID}/vote", s.authenticated(http.HandlerFunc(s.castCommunityVote)))
+	mux.Handle("POST /api/v1/community/posts/{postID}/comments", s.authenticated(http.HandlerFunc(s.createCommunityComment)))
+	mux.Handle("GET /api/v1/community/dangerous-numbers", s.authenticated(http.HandlerFunc(s.listDangerousNumbers)))
 	mux.Handle("GET /internal/v1/health", s.internalAuthenticated(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { writeJSON(w, 200, map[string]string{"status": "ok"}) })))
 	mux.Handle("GET /internal/v1/metrics", s.internalAuthenticated(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"counters": s.metricsSnapshot(), "data_store": s.db.Kind()})
@@ -201,6 +208,7 @@ func (s *server) corsAndSecurity(next http.Handler) http.Handler {
 			w.Header().Set("Access-Control-Allow-Credentials", "true")
 			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Activity, X-Request-ID")
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+			w.Header().Set("Access-Control-Expose-Headers", "Retry-After, X-Request-ID")
 		}
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
@@ -249,6 +257,58 @@ func (s *server) allow(key string, max int, window time.Duration) bool {
 	}
 	s.limits[key] = append(recent, now)
 	return true
+}
+
+// scanRateLimit throttles scan creation per authenticated user, keyed by user ID rather than
+// IP so a shared NAT cannot starve a household. File scans draw from their own, much smaller
+// hourly budget: each one occupies the isolated extraction worker and, once the vision pass is
+// enabled, spends a paid model call. Polling routes stay unthrottled on purpose, because
+// following a queued scan to its result must never be what runs out of quota.
+func (s *server) scanRateLimit(fileScan bool, next http.Handler) http.Handler {
+	hourKey, hourMax := "scan_hour:", s.cfg.scanLimitHour
+	if fileScan {
+		hourKey, hourMax = "scan_file_hour:", s.cfg.fileScanLimitHour
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		uid := requestIdentity(r).ID
+		minuteKey := "scan_min:" + uid
+		hourBucket := hourKey + uid
+		if !s.allow(minuteKey, s.cfg.scanLimitMinute, time.Minute) {
+			s.denyScan(w, minuteKey, time.Minute)
+			return
+		}
+		if !s.allow(hourBucket, hourMax, time.Hour) {
+			s.denyScan(w, hourBucket, time.Hour)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (s *server) denyScan(w http.ResponseWriter, key string, window time.Duration) {
+	s.count("scans_rate_limited")
+	w.Header().Set("Retry-After", strconv.Itoa(s.retryAfterSeconds(key, window)))
+	writeError(w, http.StatusTooManyRequests, "rate_limited")
+}
+
+// retryAfterSeconds reports how long until the oldest request inside the window ages out of it.
+func (s *server) retryAfterSeconds(key string, window time.Duration) int {
+	now := time.Now()
+	s.limitsMu.Lock()
+	defer s.limitsMu.Unlock()
+	var oldest time.Time
+	for _, seen := range s.limits[key] {
+		if now.Sub(seen) < window && (oldest.IsZero() || seen.Before(oldest)) {
+			oldest = seen
+		}
+	}
+	if oldest.IsZero() {
+		return 1
+	}
+	if seconds := int((window - now.Sub(oldest)) / time.Second); seconds > 0 {
+		return seconds + 1
+	}
+	return 1
 }
 
 type identityKey struct{}
@@ -620,14 +680,11 @@ func (s *server) createTextScan(kind string) http.HandlerFunc {
 			writeError(w, 400, "invalid_request")
 			return
 		}
-		field := "text"
-		if kind == "url" {
-			field = "url"
+		field := "url"
+		if kind == "phone" {
+			field = "number"
 		}
 		value, _ := input[field].(string)
-		if kind == "phone" {
-			value, _ = input["number"].(string)
-		}
 		value = strings.TrimSpace(value)
 		if value == "" || len(value) > 20000 {
 			writeError(w, 400, "invalid_input")
@@ -669,11 +726,7 @@ func (s *server) createTextScan(kind string) http.HandlerFunc {
 func (s *server) createFileScan(kind string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id := requestIdentity(r)
-		limitMB := s.cfg.maxUploadMB
-		if kind == "image" {
-			limitMB = s.cfg.maxImageMB
-		}
-		limit := int64(limitMB) << 20
+		limit := int64(s.cfg.maxUploadMB) << 20
 		r.Body = http.MaxBytesReader(w, r.Body, limit+(1<<20))
 		if err := r.ParseMultipartForm(4 << 20); err != nil {
 			writeError(w, 413, "file_too_large")
@@ -697,7 +750,7 @@ func (s *server) createFileScan(kind string) http.HandlerFunc {
 			writeError(w, 413, "file_too_large")
 			return
 		}
-		mimeType, valid := detectFileType(kind, filepath.Ext(header.Filename), data)
+		mimeType, valid := detectApkType(filepath.Ext(header.Filename), data)
 		if !valid {
 			writeError(w, 400, "unsupported_file_type")
 			return
@@ -834,12 +887,17 @@ func (s *server) getScan(w http.ResponseWriter, r *http.Request) {
 
 // phoneReportCategories is the canonical storage vocabulary and mirrors
 // app/phone_reports.py::REPORT_CATEGORIES; free text is never stored as a category.
+// phishing and pharming are the two board categories this endpoint did not know before the
+// community report form moved onto /community/phone: a reporter picking "Phishing" there must not
+// be sent back an invalid_category, and the three older values stay because /recognize still offers
+// them.
 var phoneReportCategories = map[string]bool{
 	"penipuan": true, "spam": true, "telemarketing": true,
 	"penagih_utang": true, "peniruan_identitas": true, "lainnya": true,
+	"phishing": true, "pharming": true,
 }
 
-var callingCodes = map[string]string{"ID": "62", "MY": "60", "SG": "65", "US": "1", "GB": "44"}
+var callingCodes = map[string]string{"ID": "62"}
 
 // validatePhoneReport returns "" when the payload is acceptable, otherwise the error code.
 func validatePhoneReport(number, region, category, note string) string {
@@ -855,28 +913,46 @@ func validatePhoneReport(number, region, category, note string) string {
 	return ""
 }
 
-// fallbackE164 mirrors app/phone_scanner.py::_fallback_normalize so reporting stays usable
-// when the analysis service is briefly unreachable. It never claims validity, it only shapes
-// the digits; the analysis service remains the authority for the stored value.
-func fallbackE164(number, region string) (string, bool) {
+// canonicalPhoneDigits mirrors phone_scanner.canonical_digits: 0812…, 62812… and +62 0812… are
+// the same subscriber, and the trunk 0 left over after the country code would store one number
+// under two keys. Indonesian subscriber numbers never start with 0 once +62 is present.
+func canonicalPhoneDigits(number string) string {
 	digits := make([]rune, 0, len(number))
 	for _, r := range number {
 		if r >= '0' && r <= '9' {
 			digits = append(digits, r)
 		}
 	}
-	if len(digits) == 0 {
+	body := string(digits)
+	if !strings.HasPrefix(body, "62") {
+		return body
+	}
+	subscriber := body[2:]
+	if strings.HasPrefix(subscriber, "0") {
+		subscriber = subscriber[1:]
+	}
+	return "62" + subscriber
+}
+
+// fallbackE164 mirrors app/phone_scanner.py::_fallback_normalize so reporting stays usable
+// when the analysis service is briefly unreachable. It never claims validity, it only shapes
+// the digits; the analysis service remains the authority for the stored value.
+func fallbackE164(number, region string) (string, bool) {
+	digits := canonicalPhoneDigits(number)
+	if digits == "" {
 		return "", false
 	}
 	code := callingCodes[strings.ToUpper(region)]
 	var body string
 	switch {
+	case code != "" && strings.HasPrefix(digits, code):
+		body = digits
 	case strings.HasPrefix(strings.TrimSpace(number), "+"):
-		body = string(digits)
+		body = digits
 	case digits[0] == '0':
-		body = code + string(digits[1:])
+		body = code + digits[1:]
 	default:
-		body = code + string(digits)
+		body = code + digits
 	}
 	if len(body) < 8 || len(body) > 15 {
 		return "", false
@@ -887,74 +963,178 @@ func fallbackE164(number, region string) (string, bool) {
 // normalizePhone delegates to the single Python implementation and falls back locally only
 // when that service cannot be reached. When it answers, its verdict is final: an empty E.164
 // means the number could not be normalised, and the local guess must not override it.
+//
+// The bool reports whether the number is a usable +62 key, not whether it is a real subscriber
+// number: a +62 number with the wrong digit count is still stored, because validity is judged
+// by the community (and shown as a finding), while +62 itself is the product scope.
 func (s *server) normalizePhone(ctx context.Context, number, region string) (string, bool) {
 	var normalized struct {
-		E164  string `json:"e164"`
-		Valid bool   `json:"valid"`
+		E164     string `json:"e164"`
+		Domestic bool   `json:"domestic"`
 	}
 	body := map[string]any{"number": number, "default_region": region}
 	if err := s.analysisRequest(ctx, http.MethodPost, "/internal/v1/phone/normalize", body, &normalized); err == nil {
-		return normalized.E164, normalized.Valid && normalized.E164 != ""
+		return normalized.E164, normalized.E164 != "" && normalized.Domestic
 	}
-	return fallbackE164(number, region)
+	e164, shaped := fallbackE164(number, region)
+	return e164, shaped && indonesianE164(e164)
+}
+
+// evidenceMime decides the type of an uploaded proof image from its bytes, not from whatever
+// the browser claimed. It mirrors app/phone_evidence.py::ALLOWED_EVIDENCE_MIME; anything the two
+// lists disagree on is refused here rather than repaired later, so a report never carries an
+// image nobody can open. GIF is left out on purpose: an animated proof is not a proof.
+func evidenceMime(data []byte, declared string) string {
+	switch detected := http.DetectContentType(data); detected {
+	case "image/png", "image/jpeg", "image/webp":
+		return detected
+	}
+	// http.DetectContentType has no signature for HEIC, and iPhone cameras produce nothing else.
+	// The ISO base-media brand at offset 8 is the magic check, so a renamed .php never passes.
+	if len(data) >= 12 && string(data[4:8]) == "ftyp" {
+		switch strings.ToLower(string(data[8:12])) {
+		case "heic", "heix", "hevc", "hevx", "mif1", "msf1":
+			if strings.ToLower(declared) == "image/heif" {
+				return "image/heif"
+			}
+			return "image/heic"
+		}
+	}
+	return ""
+}
+
+type storedEvidence struct {
+	URL      string `json:"url"`
+	PublicID string `json:"public_id"`
+	Mime     string `json:"mime"`
+}
+
+// storePhoneEvidence hands the bytes to the analysis service, which owns the Cloudinary
+// credentials. The image is passed as base64 JSON on purpose: this service has no multipart
+// client for it and the Python side has no multipart parser installed.
+func (s *server) storePhoneEvidence(ctx context.Context, userID, reference, mime string, data []byte) (*storedEvidence, bool) {
+	var stored storedEvidence
+	body := map[string]any{
+		"user_id":     userID,
+		"reference":   reference,
+		"mime":        mime,
+		"data_base64": base64.StdEncoding.EncodeToString(data),
+	}
+	// A 503 here is the service saying "this image cannot be kept", which is the same answer as
+	// a transport failure: either way the report has to be refused.
+	if err := s.analysisRequest(ctx, http.MethodPost, "/internal/v1/phone-reports/evidence", body, &stored); err != nil {
+		return nil, false
+	}
+	if stored.URL == "" || stored.PublicID == "" {
+		return nil, false
+	}
+	return &stored, true
+}
+
+// discardPhoneEvidence is cleanup, not a decision: the report is already refused, so whether the
+// asset vanished only feeds the metrics.
+func (s *server) discardPhoneEvidence(ctx context.Context, publicID string) {
+	if publicID == "" {
+		return
+	}
+	_ = s.analysisRequest(ctx, http.MethodDelete, "/internal/v1/phone-reports/evidence",
+		map[string]any{"public_id": publicID}, nil)
 }
 
 // createPhoneReport stores one pending community report. Reports never raise risk by
 // themselves: only a moderator turning them into "verified" does that (app/phone_reports.py).
+//
+// The evidence image is mandatory and stored first: "bukti wajib" only means something if a
+// report without its proof cannot exist, so every failure path here leaves nothing behind.
 func (s *server) createPhoneReport(w http.ResponseWriter, r *http.Request) {
 	id := requestIdentity(r)
-	var input struct {
-		Number        string `json:"number"`
-		DefaultRegion string `json:"default_region"`
-		Category      string `json:"category"`
-		Note          string `json:"note"`
-	}
-	if json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<10)).Decode(&input) != nil {
-		writeError(w, 400, "invalid_request")
+	limit := int64(envInt("MAX_EVIDENCE_MB", 5)) << 20
+	r.Body = http.MaxBytesReader(w, r.Body, limit+(1<<20))
+	if err := r.ParseMultipartForm(4 << 20); err != nil {
+		writeError(w, 413, "evidence_too_large")
 		return
 	}
-	number := strings.TrimSpace(input.Number)
-	region := strings.ToUpper(strings.TrimSpace(input.DefaultRegion))
+	if r.MultipartForm != nil {
+		defer r.MultipartForm.RemoveAll()
+	}
+	number := strings.TrimSpace(r.FormValue("number"))
+	region := strings.ToUpper(strings.TrimSpace(r.FormValue("default_region")))
 	if region == "" {
 		region = "ID"
 	}
-	category := strings.ToLower(strings.TrimSpace(input.Category))
-	note := strings.TrimSpace(input.Note)
+	category := strings.ToLower(strings.TrimSpace(r.FormValue("category")))
+	note := strings.TrimSpace(r.FormValue("note"))
 	if code := validatePhoneReport(number, region, category, note); code != "" {
 		writeError(w, 400, code)
+		return
+	}
+	file, header, err := r.FormFile("evidence")
+	if err != nil {
+		writeError(w, 400, "evidence_required")
+		return
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, limit+1))
+	if err != nil || int64(len(data)) > limit {
+		writeError(w, 413, "evidence_too_large")
+		return
+	}
+	mimeType := evidenceMime(data, header.Header.Get("Content-Type"))
+	if mimeType == "" {
+		writeError(w, 400, "evidence_unsupported_type")
 		return
 	}
 	if !s.allow("phone_report:"+id.ID, envInt("PHONE_REPORT_HOURLY_LIMIT", 10), time.Hour) {
 		writeError(w, 429, "rate_limited")
 		return
 	}
-	e164, valid := s.normalizePhone(r.Context(), number, region)
-	if e164 == "" || !valid {
+	e164, domestic := s.normalizePhone(r.Context(), number, region)
+	if e164 == "" {
 		writeError(w, 400, "invalid_phone")
+		return
+	}
+	if !domestic {
+		writeError(w, 400, "not_indonesian")
 		return
 	}
 	if exists, err := s.db.PhoneReportExists(r.Context(), id.ID, e164); err == nil && exists {
 		writeError(w, 409, "duplicate_report")
 		return
 	}
-	row := map[string]any{"number_e164": e164, "category": category, "source": "user_report", "reported_by": id.ID, "status": "pending"}
+	stored, ok := s.storePhoneEvidence(r.Context(), id.ID, randomID(), mimeType, data)
+	if !ok {
+		writeError(w, 503, "evidence_unavailable")
+		return
+	}
+	row := map[string]any{
+		"number_e164":        e164,
+		"category":           category,
+		"source":             "user_report",
+		"reported_by":        id.ID,
+		"status":             "pending",
+		"evidence_url":       stored.URL,
+		"evidence_public_id": stored.PublicID,
+	}
 	if note != "" {
 		row["note"] = note
 	}
 	noteSaved := note != ""
 	if err := s.db.InsertPhoneReport(r.Context(), row); err != nil {
 		if exists, checkErr := s.db.PhoneReportExists(r.Context(), id.ID, e164); checkErr == nil && exists {
+			s.discardPhoneEvidence(r.Context(), stored.PublicID)
 			writeError(w, 409, "duplicate_report")
 			return
 		}
-		if note == "" {
-			writeError(w, 503, "service_unavailable")
-			return
+		if note != "" {
+			// A database without the optional note column still stores the report itself.
+			delete(row, "note")
+			noteSaved = false
+			err = s.db.InsertPhoneReport(r.Context(), row)
 		}
-		// A database without the optional note column still stores the report itself.
-		delete(row, "note")
-		noteSaved = false
-		if retryErr := s.db.InsertPhoneReport(r.Context(), row); retryErr != nil {
+		if err != nil {
+			// The evidence columns are additive too, but unlike the note they cannot be dropped:
+			// the migration has to be applied before reports can be accepted.
+			s.discardPhoneEvidence(r.Context(), stored.PublicID)
 			writeError(w, 503, "service_unavailable")
 			return
 		}
@@ -1137,14 +1317,19 @@ func validPhoneChars(value string) bool {
 	return true
 }
 
+// allowedPhoneRegion keeps the product scope honest: only Indonesian numbers are accepted,
+// so no other country's subscribers can be entered into the community database.
 func allowedPhoneRegion(region string) bool {
-	switch strings.ToUpper(region) {
-	case "ID", "MY", "SG", "US", "GB":
-		return true
-	default:
-		return false
-	}
+	return strings.EqualFold(region, "ID")
 }
+
+// indonesianE164 reports whether a normalised number actually carries the +62 country code.
+// The region field alone is not enough: "+1 202 555 0123" submitted with region ID normalises
+// to a US number, and that must not reach storage or the checker.
+func indonesianE164(e164 string) bool {
+	return strings.HasPrefix(e164, "+62")
+}
+
 func nested(value map[string]any, outer, inner string) any {
 	if m, ok := value[outer].(map[string]any); ok {
 		return m[inner]
@@ -1180,24 +1365,12 @@ func escapeObjectPath(path string) string {
 	}
 	return strings.Join(parts, "/")
 }
-func detectFileType(kind, ext string, data []byte) (string, bool) {
-	if kind == "application" {
-		if strings.EqualFold(ext, ".apk") && len(data) >= 4 && bytes.Equal(data[:4], []byte{'P', 'K', 3, 4}) {
-			archive, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
-			return "application/vnd.android.package-archive", err == nil && len(archive.File) > 0
-		}
+func detectApkType(ext string, data []byte) (string, bool) {
+	if !strings.EqualFold(ext, ".apk") || len(data) < 4 || !bytes.Equal(data[:4], []byte{'P', 'K', 3, 4}) {
 		return "", false
 	}
-	if len(data) >= 8 && bytes.Equal(data[:8], []byte{137, 80, 78, 71, 13, 10, 26, 10}) {
-		return "image/png", true
-	}
-	if len(data) >= 3 && data[0] == 0xff && data[1] == 0xd8 && data[2] == 0xff {
-		return "image/jpeg", true
-	}
-	if len(data) >= 12 && string(data[:4]) == "RIFF" && string(data[8:12]) == "WEBP" {
-		return "image/webp", true
-	}
-	return "", false
+	archive, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	return "application/vnd.android.package-archive", err == nil && len(archive.File) > 0
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {

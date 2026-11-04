@@ -6,6 +6,9 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -23,7 +26,7 @@ func TestRejectsUnsignedJWT(t *testing.T) {
 }
 
 func TestRejectsFakeAPKZip(t *testing.T) {
-	if _, ok := detectFileType("application", ".apk", []byte("PK\x03\x04not-a-zip")); ok {
+	if _, ok := detectApkType(".apk", []byte("PK\x03\x04not-a-zip")); ok {
 		t.Fatal("fake APK accepted")
 	}
 	var buffer bytes.Buffer
@@ -38,30 +41,29 @@ func TestRejectsFakeAPKZip(t *testing.T) {
 	if err = writer.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := detectFileType("application", ".apk", buffer.Bytes()); !ok {
+	if _, ok := detectApkType(".apk", buffer.Bytes()); !ok {
 		t.Fatal("valid APK ZIP rejected")
 	}
 }
 
-func TestRejectsInvalidImageMagic(t *testing.T) {
-	if _, ok := detectFileType("image", ".png", []byte("not an image")); ok {
-		t.Fatal("invalid image accepted")
+func TestRejectsUploadsThatAreNotAPKs(t *testing.T) {
+	png := append([]byte{137, 80, 78, 71, 13, 10, 26, 10}, make([]byte, 16)...)
+	if _, ok := detectApkType(".png", png); ok {
+		t.Fatal("image upload accepted as an application scan")
+	}
+	if _, ok := detectApkType(".apk", png); ok {
+		t.Fatal("non-ZIP bytes accepted as an APK")
 	}
 }
 
 func TestPhoneRegionAllowlist(t *testing.T) {
-	if !allowedPhoneRegion("ID") || allowedPhoneRegion("ZZ") {
-		t.Fatal("phone region allowlist is incorrect")
+	if !allowedPhoneRegion("ID") || !allowedPhoneRegion("id") {
+		t.Fatal("Indonesia rejected")
 	}
-}
-
-func TestAcceptsSupportedImageFormats(t *testing.T) {
-	if mime, ok := detectFileType("image", ".jpg", []byte{0xff, 0xd8, 0xff, 0xe0}); !ok || mime != "image/jpeg" {
-		t.Fatalf("jpeg not detected: %q %v", mime, ok)
-	}
-	webp := append([]byte("RIFF\x00\x00\x00\x00"), []byte("WEBP")...)
-	if mime, ok := detectFileType("image", ".webp", webp); !ok || mime != "image/webp" {
-		t.Fatalf("webp not detected: %q %v", mime, ok)
+	for _, region := range []string{"MY", "SG", "US", "GB", "ZZ", ""} {
+		if allowedPhoneRegion(region) {
+			t.Fatalf("region %q accepted; scope is +62 only", region)
+		}
 	}
 }
 
@@ -154,8 +156,14 @@ func TestFallbackE164FollowsRegionRules(t *testing.T) {
 	}{
 		{"0812-3456-7890", "ID", "+6281234567890", true},
 		{"081234567890", "id", "+6281234567890", true},
-		{"+1 202 555 0123", "US", "+12025550123", true},
-		{"2025550123", "US", "+12025550123", true},
+		{"+62 812 3456 7890", "ID", "+6281234567890", true},
+		// One number, several spellings: the trunk 0 left after 62 is dropped so the degraded
+		// path stores the same key the analysis service would have produced.
+		{"6281234567890", "ID", "+6281234567890", true},
+		{"+62 0812-3456-7890", "ID", "+6281234567890", true},
+		{"62 0812 3456 7890", "ID", "+6281234567890", true},
+		{"0214214214", "ID", "+62214214214", true},
+		{"+1 202 555 0123", "ID", "+12025550123", true},
 		{"0899", "ID", "", false},
 		{"", "ID", "", false},
 	}
@@ -167,9 +175,27 @@ func TestFallbackE164FollowsRegionRules(t *testing.T) {
 	}
 }
 
+func TestIndonesianE164Gate(t *testing.T) {
+	if !indonesianE164("+6281234567890") {
+		t.Fatal("a +62 number rejected")
+	}
+	for _, value := range []string{"+12025550123", "+60123456789", "6281234567890", ""} {
+		if indonesianE164(value) {
+			t.Fatalf("non-E.164 or non-+62 value accepted: %q", value)
+		}
+	}
+}
+
 func TestValidatePhoneReportRejectsBadInput(t *testing.T) {
 	if code := validatePhoneReport("081234567890", "ID", "penipuan", ""); code != "" {
 		t.Fatalf("valid report rejected with %q", code)
+	}
+	// The board's five categories all have to land here, or a report written on /community/phone
+	// would be refused for a word the board itself offers.
+	for _, category := range []string{"phishing", "pharming", "peniruan_identitas", "spam"} {
+		if code := validatePhoneReport("081234567890", "ID", category, ""); code != "" {
+			t.Fatalf("board category %q rejected with %q", category, code)
+		}
 	}
 	if code := validatePhoneReport("081234567890", "ZZ", "penipuan", ""); code != "invalid_phone" {
 		t.Fatalf("unknown region accepted: %q", code)
@@ -205,5 +231,46 @@ func TestAllowEnforcesSlidingWindowPerKey(t *testing.T) {
 	// A zero/negative limit disables the check instead of blocking everything.
 	if !s.allow("phone_report:user-a", 0, time.Hour) {
 		t.Fatal("disabled limit should allow the call")
+	}
+}
+
+func TestScanRateLimitSeparatesFileAndTextBudgets(t *testing.T) {
+	s := &server{cfg: config{scanLimitMinute: 3, scanLimitHour: 2, fileScanLimitHour: 1},
+		limits: map[string][]time.Time{}, metrics: map[string]int64{}}
+	accepted := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusAccepted) })
+	call := func(userID string, fileScan bool) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/scans/application", nil)
+		req = req.WithContext(context.WithValue(req.Context(), identityKey{}, identity{ID: userID}))
+		s.scanRateLimit(fileScan, accepted).ServeHTTP(rec, req)
+		return rec
+	}
+
+	if rec := call("user-a", true); rec.Code != http.StatusAccepted {
+		t.Fatalf("first file scan = %d, want 202", rec.Code)
+	}
+	if rec := call("user-a", true); rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("second file scan = %d, want 429 once the file budget is spent", rec.Code)
+	}
+	// Text scans keep their own hourly budget, so exhausting APK scans cannot lock the user out.
+	if rec := call("user-a", false); rec.Code != http.StatusAccepted {
+		t.Fatalf("text scan after the file quota = %d, want 202", rec.Code)
+	}
+	// Another user must not inherit anyone's bucket.
+	if rec := call("user-b", true); rec.Code != http.StatusAccepted {
+		t.Fatalf("first file scan for a second user = %d, want 202", rec.Code)
+	}
+	rec := call("user-a", false)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("shared minute bucket did not cap the burst: %d", rec.Code)
+	}
+	// Retry-After has to reach the browser for the UI to say how long the wait is.
+	after := rec.Header().Get("Retry-After")
+	retry, err := strconv.Atoi(after)
+	if err != nil || retry < 1 || retry > 3600 {
+		t.Fatalf("Retry-After = %q, want a number of seconds between 1 and 3600", after)
+	}
+	if got := s.metricsSnapshot()["scans_rate_limited"]; got != 2 {
+		t.Fatalf("scans_rate_limited = %d, want 2", got)
 	}
 }
