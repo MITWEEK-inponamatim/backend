@@ -75,6 +75,10 @@ type dataStore interface {
 	GetSession(ctx context.Context, userID, sessionID string) (*sessionInfo, bool, error)
 	TouchSession(ctx context.Context, userID, sessionID string, at time.Time) error
 	RevokeSessionByID(ctx context.Context, id, reason string) error
+	GetUserRole(ctx context.Context, userID string) (string, error)
+	ListCommunityPostsAdmin(ctx context.Context, status string, limit, offset int) ([]map[string]any, error)
+	UpdateCommunityPostStatus(ctx context.Context, postID, status string) (bool, error)
+
 	RevokeSessionByToken(ctx context.Context, userID, sessionID, reason string) error
 	SessionExists(ctx context.Context, sessionID string) (bool, error)
 	InsertSession(ctx context.Context, userID, sessionID, ip, userAgent string) error
@@ -289,7 +293,47 @@ func (r *restStore) DangerousNumbers(ctx context.Context, limit, offset int) ([]
 	}
 	return rows, nil
 }
+func (r *restStore) GetUserRole(ctx context.Context, userID string) (string, error) {
+	path := "/rest/v1/profiles?select=role&id=eq." + url.QueryEscape(userID) + "&limit=1"
+	var rows []map[string]any
+	if err := r.call(ctx, "GET", path, nil, &rows); err != nil {
+		return "", err
+	}
+	if len(rows) == 0 {
+		return "user", nil
+	}
+	if role, ok := rows[0]["role"].(string); ok {
+		return role, nil
+	}
+	return "user", nil
+}
 
+func (r *restStore) ListCommunityPostsAdmin(ctx context.Context, status string, limit, offset int) ([]map[string]any, error) {
+	path := "/rest/v1/community_posts?select=" + communityPostColumns + "&order=created_at.desc"
+	if status != "all" {
+		path += "&status=eq." + url.QueryEscape(status)
+	}
+	path += "&limit=" + url.QueryEscape(strconv.Itoa(limit)) + "&offset=" + url.QueryEscape(strconv.Itoa(offset))
+	var rows []map[string]any
+	if err := r.call(ctx, "GET", path, nil, &rows); err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
+func (r *restStore) UpdateCommunityPostStatus(ctx context.Context, postID, status string) (bool, error) {
+	path := "/rest/v1/community_posts?id=eq." + url.QueryEscape(postID)
+	payload := map[string]any{"status": status}
+	if err := r.call(ctx, "PATCH", path, payload, nil); err != nil {
+		return false, err
+	}
+	var rows []map[string]any
+	checkPath := "/rest/v1/community_posts?select=id&id=eq." + url.QueryEscape(postID) + "&limit=1"
+	if err := r.call(ctx, "GET", checkPath, nil, &rows); err != nil {
+		return false, err
+	}
+	return len(rows) > 0, nil
+}
 func (r *restStore) GetSession(ctx context.Context, userID, sessionID string) (*sessionInfo, bool, error) {
 	path := "/rest/v1/app_sessions?select=id,created_at,last_activity_at,revoked_at,revoked_reason&user_id=eq." + url.QueryEscape(userID) + "&supabase_session_id=eq." + url.QueryEscape(sessionID) + "&limit=1"
 	var rows []struct {
@@ -776,6 +820,56 @@ func (p *pgxStore) DangerousNumbers(ctx context.Context, limit, offset int) ([]m
 
 // moment keeps the two stores producing the same JSON: PostgREST already hands back timestamp
 // strings, so the direct-database path formats them the same way instead of shipping Go's own.
+
+func (p *pgxStore) GetUserRole(ctx context.Context, userID string) (string, error) {
+	var role string
+	err := p.pool.QueryRow(ctx, `select role from public.profiles where id = $1::uuid`, userID).Scan(&role)
+	if err != nil {
+		return "user", nil
+	}
+	return role, nil
+}
+
+func (p *pgxStore) ListCommunityPostsAdmin(ctx context.Context, status string, limit, offset int) ([]map[string]any, error) {
+	sql := `select id, number_e164, category, title, body, evidence_url, author_alias,
+	               up_count, down_count, score, comment_count, created_at, status
+	          from public.community_posts`
+	if status != "all" {
+		sql += ` where status = $3`
+	}
+	sql += ` order by created_at desc limit $1 offset $2`
+	
+	var rows pgx.Rows
+	var err error
+	if status != "all" {
+		rows, err = p.pool.Query(ctx, sql, limit, offset, status)
+	} else {
+		rows, err = p.pool.Query(ctx, sql, limit, offset)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	
+	var results []map[string]any
+	for rows.Next() {
+		var row postFields
+		if err := rows.Scan(&row.id, &row.number, &row.category, &row.title, &row.body, &row.evidence, &row.alias,
+			&row.up, &row.down, &row.score, &row.comments, &row.createdAt, &row.state); err != nil {
+			return nil, err
+		}
+		results = append(results, postRecord(row))
+	}
+	return results, rows.Err()
+}
+
+func (p *pgxStore) UpdateCommunityPostStatus(ctx context.Context, postID, status string) (bool, error) {
+	tag, err := p.pool.Exec(ctx, `update public.community_posts set status = $2 where id = $1::uuid`, postID, status)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
+}
 func moment(value time.Time) string {
 	return value.UTC().Format(time.RFC3339)
 }

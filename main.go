@@ -154,6 +154,8 @@ func main() {
 	mux.Handle("POST /api/v1/community/posts/{postID}/vote", s.authenticated(http.HandlerFunc(s.castCommunityVote)))
 	mux.Handle("POST /api/v1/community/posts/{postID}/comments", s.authenticated(http.HandlerFunc(s.createCommunityComment)))
 	mux.Handle("GET /api/v1/community/dangerous-numbers", s.authenticated(http.HandlerFunc(s.listDangerousNumbers)))
+	mux.Handle("GET /api/v1/admin/community/posts", s.adminOnly(http.HandlerFunc(s.listCommunityPostsAdmin)))
+	mux.Handle("PATCH /api/v1/admin/community/posts/{postID}/status", s.adminOnly(http.HandlerFunc(s.updateCommunityPostStatus)))
 	mux.Handle("GET /internal/v1/health", s.internalAuthenticated(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { writeJSON(w, 200, map[string]string{"status": "ok"}) })))
 	mux.Handle("GET /internal/v1/metrics", s.internalAuthenticated(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"counters": s.metricsSnapshot(), "data_store": s.db.Kind()})
