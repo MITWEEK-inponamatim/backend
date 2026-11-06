@@ -41,6 +41,10 @@ type stubStore struct {
 	parentFound    bool
 	dangerousRows  []map[string]any
 	dangerousErr   error
+
+	// History list rows, and the filter the handler passed down.
+	scanRows      []any
+	listScanTypes []string
 }
 
 func (f *stubStore) InsertScan(context.Context, map[string]any) error { return nil }
@@ -50,8 +54,14 @@ func (f *stubStore) PatchScan(context.Context, string, map[string]any) error {
 func (f *stubStore) GetScan(context.Context, string, string) (map[string]any, bool, error) {
 	return nil, false, nil
 }
-func (f *stubStore) ListScans(context.Context, string, int, int) ([]any, error) { return nil, nil }
-func (f *stubStore) InsertFile(context.Context, map[string]any) error           { return nil }
+func (f *stubStore) ListScans(_ context.Context, _ string, types []string, _, _ int) ([]any, error) {
+	f.listScanTypes = types
+	if f.scanRows != nil {
+		return f.scanRows, nil
+	}
+	return []any{}, nil
+}
+func (f *stubStore) InsertFile(context.Context, map[string]any) error { return nil }
 
 func (f *stubStore) InsertPhoneReport(_ context.Context, row map[string]any) error {
 	f.inserts = append(f.inserts, row)

@@ -56,7 +56,7 @@ type dataStore interface {
 	InsertScan(ctx context.Context, row map[string]any) error
 	PatchScan(ctx context.Context, scanID string, fields map[string]any) error
 	GetScan(ctx context.Context, userID, scanID string) (map[string]any, bool, error)
-	ListScans(ctx context.Context, userID string, limit, offset int) ([]any, error)
+	ListScans(ctx context.Context, userID string, types []string, limit, offset int) ([]any, error)
 	InsertFile(ctx context.Context, row map[string]any) error
 
 	InsertPhoneReport(ctx context.Context, row map[string]any) error
@@ -130,7 +130,7 @@ func (r *restStore) PatchScan(ctx context.Context, scanID string, fields map[str
 }
 
 func (r *restStore) GetScan(ctx context.Context, userID, scanID string) (map[string]any, bool, error) {
-	path := "/rest/v1/scans?select=id,type,status,outcome,risk_level,report,error,created_at,updated_at,finished_at&user_id=eq." + url.QueryEscape(userID) + "&id=eq." + url.QueryEscape(scanID) + "&limit=1"
+	path := "/rest/v1/scans?select=id,type,input_ref,status,outcome,risk_level,report,error,created_at,updated_at,finished_at&user_id=eq." + url.QueryEscape(userID) + "&id=eq." + url.QueryEscape(scanID) + "&limit=1"
 	var rows []map[string]any
 	if err := r.call(ctx, "GET", path, nil, &rows); err != nil {
 		return nil, false, err
@@ -141,8 +141,11 @@ func (r *restStore) GetScan(ctx context.Context, userID, scanID string) (map[str
 	return rows[0], true, nil
 }
 
-func (r *restStore) ListScans(ctx context.Context, userID string, limit, offset int) ([]any, error) {
+func (r *restStore) ListScans(ctx context.Context, userID string, types []string, limit, offset int) ([]any, error) {
 	path := fmt.Sprintf("/rest/v1/scans?select=id,type,input_ref,status,outcome,risk_level,created_at,updated_at,finished_at&user_id=eq.%s&order=created_at.desc&limit=%d&offset=%d", url.QueryEscape(userID), limit, offset)
+	if len(types) > 0 {
+		path += "&type=in.(" + strings.Join(types, ",") + ")"
+	}
 	var rows []any
 	if err := r.call(ctx, "GET", path, nil, &rows); err != nil {
 		return nil, err
@@ -450,6 +453,7 @@ func (p *pgxStore) PatchScan(ctx context.Context, scanID string, fields map[stri
 func (p *pgxStore) GetScan(ctx context.Context, userID, scanID string) (map[string]any, bool, error) {
 	var (
 		id, kind, status   string
+		inputRef           *string
 		outcome, riskLevel *string
 		report             []byte
 		errText            *string
@@ -458,9 +462,9 @@ func (p *pgxStore) GetScan(ctx context.Context, userID, scanID string) (map[stri
 		finishedAt         *time.Time
 	)
 	row := p.pool.QueryRow(ctx,
-		`select id, type, status, outcome, risk_level, report, error, created_at, updated_at, finished_at
+		`select id, type, input_ref, status, outcome, risk_level, report, error, created_at, updated_at, finished_at
 		 from public.scans where id = $1::uuid and user_id = $2::uuid`, scanID, userID)
-	if err := row.Scan(&id, &kind, &status, &outcome, &riskLevel, &report, &errText, &createdAt, &updatedAt, &finishedAt); err != nil {
+	if err := row.Scan(&id, &kind, &inputRef, &status, &outcome, &riskLevel, &report, &errText, &createdAt, &updatedAt, &finishedAt); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, false, nil
 		}
@@ -468,6 +472,9 @@ func (p *pgxStore) GetScan(ctx context.Context, userID, scanID string) (map[stri
 	}
 	record := map[string]any{
 		"id": id, "type": kind, "status": status, "created_at": createdAt, "updated_at": updatedAt,
+	}
+	if inputRef != nil {
+		record["input_ref"] = *inputRef
 	}
 	if outcome != nil {
 		record["outcome"] = *outcome
@@ -490,10 +497,12 @@ func (p *pgxStore) GetScan(ctx context.Context, userID, scanID string) (map[stri
 	return record, true, nil
 }
 
-func (p *pgxStore) ListScans(ctx context.Context, userID string, limit, offset int) ([]any, error) {
+func (p *pgxStore) ListScans(ctx context.Context, userID string, types []string, limit, offset int) ([]any, error) {
 	rows, err := p.pool.Query(ctx,
 		`select id, type, input_ref, status, outcome, risk_level, created_at, updated_at, finished_at
-		 from public.scans where user_id = $1::uuid order by created_at desc limit $2 offset $3`, userID, limit, offset)
+		 from public.scans
+			 where user_id = $1::uuid and ($2::text[] is null or type = any($2))
+			 order by created_at desc limit $3 offset $4`, userID, types, limit, offset)
 	if err != nil {
 		return nil, err
 	}

@@ -274,3 +274,52 @@ func TestScanRateLimitSeparatesFileAndTextBudgets(t *testing.T) {
 		t.Fatalf("scans_rate_limited = %d, want 2", got)
 	}
 }
+
+func TestScanTypeFilterOnlyAdmitsStoredKinds(t *testing.T) {
+	for _, tc := range []struct {
+		raw, want string
+		ok        bool
+	}{
+		{raw: "", want: "", ok: true},
+		{raw: "url", want: "url", ok: true},
+		{raw: "url,application", want: "url,application", ok: true},
+		{raw: "phone", want: "phone", ok: true},
+		{raw: "url,phone_report", ok: false},
+		{raw: ",", ok: false},
+		{raw: "URL", ok: false},
+	} {
+		got, err := scanTypeFilter(tc.raw)
+		if tc.ok != (err == nil) {
+			t.Fatalf("scanTypeFilter(%q) err = %v, want ok = %v", tc.raw, err, tc.ok)
+		}
+		if strings.Join(got, ",") != tc.want {
+			t.Fatalf("scanTypeFilter(%q) = %v, want %q", tc.raw, got, tc.want)
+		}
+	}
+}
+
+func TestListScansCarriesTheTypeFilter(t *testing.T) {
+	store := &stubStore{scanRows: []any{map[string]any{"id": "1b1c2d3e-4f50-4a6b-8c7d-9e0f1a2b3c4d", "type": "url"}}}
+	s := communityServer(t, store, "+6281234567890")
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/scans?type=url,application&limit=5&offset=2", nil)
+	request = request.WithContext(context.WithValue(request.Context(), identityKey{}, identity{ID: testUserID, SessionID: "session"}))
+	recorder := httptest.NewRecorder()
+	s.listScans(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if strings.Join(store.listScanTypes, ",") != "url,application" {
+		t.Fatalf("type filter not carried through: %v", store.listScanTypes)
+	}
+}
+
+func TestListScansRejectsUnknownType(t *testing.T) {
+	s := communityServer(t, &stubStore{}, "+6281234567890")
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/scans?type=drop_table", nil)
+	request = request.WithContext(context.WithValue(request.Context(), identityKey{}, identity{ID: testUserID, SessionID: "session"}))
+	recorder := httptest.NewRecorder()
+	s.listScans(recorder, request)
+	if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), "invalid_request") {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+}

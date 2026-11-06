@@ -856,12 +856,35 @@ func (s *server) listScans(w http.ResponseWriter, r *http.Request) {
 	if offset < 0 {
 		offset = 0
 	}
-	rows, err := s.db.ListScans(r.Context(), id.ID, limit, offset)
+	types, err := scanTypeFilter(r.URL.Query().Get("type"))
+	if err != nil {
+		writeError(w, 400, "invalid_request")
+		return
+	}
+	rows, err := s.db.ListScans(r.Context(), id.ID, types, limit, offset)
 	if err != nil {
 		writeError(w, 503, "service_unavailable")
 		return
 	}
 	writeJSON(w, 200, map[string]any{"scans": rows, "limit": limit, "offset": offset})
+}
+
+// scanTypeFilter reads the optional ?type= list off the history endpoint. Only the kinds the
+// scanner actually stores get through, so the string that reaches the query has been checked
+// against a closed set rather than taken from the browser.
+func scanTypeFilter(raw string) ([]string, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	known := map[string]bool{"url": true, "phone": true, "application": true}
+	types := make([]string, 0, len(known))
+	for _, part := range strings.Split(raw, ",") {
+		if !known[part] {
+			return nil, errors.New("unknown scan type")
+		}
+		types = append(types, part)
+	}
+	return types, nil
 }
 
 func (s *server) getScan(w http.ResponseWriter, r *http.Request) {
