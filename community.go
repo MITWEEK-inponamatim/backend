@@ -182,6 +182,9 @@ func (s *server) listCommunityPosts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.attachMyVotes(r.Context(), id.ID, rows)
+	for _, row := range rows {
+		publicPost(row, id.ID)
+	}
 	writeJSON(w, 200, map[string]any{"posts": rows, "sort": sort, "limit": filter.Limit, "offset": filter.Offset})
 }
 
@@ -208,7 +211,78 @@ func (s *server) getCommunityPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	post["my_vote"] = votes[str(post["id"])]
-	writeJSON(w, 200, map[string]any{"post": post, "comments": commentThread(comments)})
+	for _, row := range comments {
+		publicComment(row, id.ID)
+	}
+	writeJSON(w, 200, map[string]any{"post": publicPost(post, id.ID), "comments": commentThread(comments)})
+}
+
+// deleteCommunityComment erases one of the caller's own comments, or one of their replies, for good.
+// Same rule as deleting a story: no restore, no record kept. What the caller should know before they
+// click is that the replies under a comment are children of it in the database, so they go too —
+// including replies written by other accounts, which is why the board asks first.
+func (s *server) deleteCommunityComment(w http.ResponseWriter, r *http.Request) {
+	id := requestIdentity(r)
+	postID, commentID := r.PathValue("postID"), r.PathValue("commentID")
+	if len(postID) != 36 || len(commentID) != 36 {
+		writeError(w, 404, "not_found")
+		return
+	}
+	deleted, err := s.db.DeleteCommunityComment(r.Context(), postID, commentID, id.ID)
+	if err != nil {
+		s.count("community_comments_delete_failed")
+		writeError(w, 503, "service_unavailable")
+		return
+	}
+	if !deleted {
+		// Not yours, not in this story, or already gone: all three answer like a missing comment, so
+		// this route cannot be walked to find out who wrote what.
+		writeError(w, 404, "not_found")
+		return
+	}
+	s.count("community_comments_deleted")
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// deleteCommunityPost erases one of the caller's own posts for good: the row, its comments and
+// votes (the database cascades those), and the screenshot in Cloudinary. No restore and no record
+// is kept — the person who wrote something they regret is allowed to make it actually gone, which
+// is the only reason this route exists rather than a request to a moderator.
+func (s *server) deleteCommunityPost(w http.ResponseWriter, r *http.Request) {
+	id := requestIdentity(r)
+	postID := r.PathValue("postID")
+	if len(postID) != 36 {
+		writeError(w, 404, "not_found")
+		return
+	}
+	// Read first only to learn the evidence's public id: once the row is gone that key is gone too,
+	// and the image would stay in Cloudinary forever with nothing pointing at it.
+	post, found, err := s.db.GetCommunityPost(r.Context(), postID)
+	if err != nil {
+		writeError(w, 503, "service_unavailable")
+		return
+	}
+	if !found {
+		writeError(w, 404, "not_found")
+		return
+	}
+	deleted, err := s.db.DeleteCommunityPost(r.Context(), postID, id.ID)
+	if err != nil {
+		s.count("community_posts_delete_failed")
+		writeError(w, 503, "service_unavailable")
+		return
+	}
+	if !deleted {
+		// Somebody else's story answers the same way a missing one does, so this route cannot be
+		// used to walk ids and find out which posts belong to other accounts.
+		writeError(w, 404, "not_found")
+		return
+	}
+	if publicID := str(post["evidence_public_id"]); publicID != "" {
+		s.discardPhoneEvidence(r.Context(), publicID)
+	}
+	s.count("community_posts_deleted")
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *server) castCommunityVote(w http.ResponseWriter, r *http.Request) {
@@ -320,7 +394,7 @@ func (s *server) createCommunityComment(w http.ResponseWriter, r *http.Request) 
 	// created_at dihitung database, jadi untaian di-refetch: waktu yang dikirim sini cuma tebakan.
 	writeJSON(w, http.StatusAccepted, map[string]any{
 		"id": comment["id"], "post_id": comment["post_id"], "body": body,
-		"author_alias": comment["author_alias"],
+		"author_alias": comment["author_alias"], "is_author": true,
 	})
 }
 
@@ -350,6 +424,25 @@ func (s *server) communityPost(ctx context.Context, postID string) (map[string]a
 		return nil, false, nil
 	}
 	return post, true, nil
+}
+
+// publicPost trims the two columns a post row carries only for this service's own decisions.
+// author_user_id is a stable account id, so the alias is the handle that goes public, and
+// evidence_public_id is the Cloudinary key that would let anybody address the asset directly.
+// What the feed gets in their place is is_author: one bit that says this story is yours to delete.
+func publicPost(row map[string]any, userID string) map[string]any {
+	row["is_author"] = userID != "" && str(row["author_user_id"]) == userID
+	delete(row, "author_user_id")
+	delete(row, "evidence_public_id")
+	return row
+}
+
+// publicComment trims a comment row the same way publicPost trims a story: the account id stays
+// behind, and the reader gets is_author — one bit that says this reply is theirs to erase.
+func publicComment(row map[string]any, userID string) map[string]any {
+	row["is_author"] = userID != "" && str(row["author_user_id"]) == userID
+	delete(row, "author_user_id")
+	return row
 }
 
 func (s *server) attachMyVotes(ctx context.Context, userID string, rows []map[string]any) {

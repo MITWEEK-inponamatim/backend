@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
@@ -45,12 +46,125 @@ type postFilter struct {
 	Offset   int
 }
 
+// queueFilter is one moderation queue: a status bucket, an optional search, and a page. Which
+// columns a free-text search may reach belongs to the table, so each store supplies its own.
+type queueFilter struct {
+	Status string
+	Search string
+	Limit  int
+	Offset int
+}
+
+// phoneReportSearchCols and communityPostSearchCols are the columns the console's search box can
+// read. Both start with the number, because that is what a moderator is usually looking for.
+var (
+	phoneReportSearchCols   = []string{"number_e164", "note", "category"}
+	communityPostSearchCols = []string{"number_e164", "title", "body"}
+)
+
+// rest renders the filter as PostgREST query parameters.
+func (f queueFilter) rest(columns ...string) string {
+	var clauses []string
+	if f.Status != "" && f.Status != "all" {
+		clauses = append(clauses, "status=eq."+url.QueryEscape(f.Status))
+	}
+	if clause := f.searchClause(columns...); clause != "" {
+		clauses = append(clauses, clause)
+	}
+	if len(clauses) == 0 {
+		return ""
+	}
+	return "&" + strings.Join(clauses, "&")
+}
+
+// searchClause narrows a search to one canonical number when the text is a number, and to a
+// substring sweep over the queue's own columns when it is not.
+func (f queueFilter) searchClause(columns ...string) string {
+	if f.Search == "" {
+		return ""
+	}
+	if e164, ok := communityNumberKey(f.Search); ok {
+		return "number_e164=eq." + url.QueryEscape(e164)
+	}
+	pattern := searchPattern(f.Search)
+	if pattern == "" {
+		return ""
+	}
+	// Spaces go out as %20: QueryEscape would write a "+" that PostgREST is free to read as a
+	// literal plus sign.
+	wildcard := strings.ReplaceAll(pattern, " ", "%20")
+	likes := make([]string, 0, len(columns))
+	for _, column := range columns {
+		likes = append(likes, column+".ilike.*"+wildcard+"*")
+	}
+	return "or=(" + strings.Join(likes, ",") + ")"
+}
+
+// MAX_SEARCH_RUNES bounds the query string a console search can produce.
+const maxSearchRunes = 60
+
+// searchPattern keeps a free-text search from becoming filter grammar: PostgREST reads
+// parentheses, commas, dots and wildcards as instructions, so anything that is not a plain word
+// character is cut before the value is handed back to it.
+func searchPattern(raw string) string {
+	trimmed := strings.ToLower(strings.TrimSpace(raw))
+	if trimmed == "" {
+		return ""
+	}
+	var kept []rune
+	for _, r := range trimmed {
+		if len(kept) >= maxSearchRunes {
+			break
+		}
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '-', r == '_', r == ' ':
+			kept = append(kept, r)
+		}
+	}
+	return strings.Join(strings.Fields(string(kept)), " ")
+}
+
+// where builds the same filter for the direct Postgres path. Placeholders are numbered from
+// `first`, so a caller that already bound limit and offset passes 3.
+func (f queueFilter) where(first int, columns ...string) (string, []any) {
+	var clauses []string
+	var args []any
+	bind := func(clause string, arg any) {
+		clauses = append(clauses, strings.ReplaceAll(clause, "$?", fmt.Sprintf("$%d", first+len(args))))
+		args = append(args, arg)
+	}
+	if f.Status != "" && f.Status != "all" {
+		bind("status = $?", f.Status)
+	}
+	if f.Search != "" {
+		if e164, ok := communityNumberKey(f.Search); ok {
+			bind("number_e164 = $?", e164)
+		} else if pattern := searchPattern(f.Search); pattern != "" {
+			likes := make([]string, 0, len(columns))
+			for _, column := range columns {
+				likes = append(likes, column+" ilike $?")
+			}
+			bind("("+strings.Join(likes, " or ")+")", "%"+pattern+"%")
+		}
+	}
+	if len(clauses) == 0 {
+		return "", args
+	}
+	return " where " + strings.Join(clauses, " and "), args
+}
+
 // communityPostColumns is shared so a feed row and a detail row never disagree about which
-// fields the browser is allowed to see. author_user_id is deliberately absent: only the alias
-// leaves this service. status is read because the handlers refuse anything a moderator took
-// down, and it is always "active" by the time a row reaches the browser.
-const communityPostColumns = "id,number_e164,category,title,body,evidence_url,author_alias,up_count,down_count,score,comment_count,created_at,status"
-const communityCommentColumns = "id,post_id,parent_id,body,author_alias,created_at"
+// fields the browser is allowed to see. author_user_id is read only so a handler can answer
+// "is this the caller's own post" and is stripped before the row leaves this service — the
+// account id is a stable identifier, so only the alias reaches the browser. status is read
+// because the handlers refuse anything a moderator took down, and it is always "active" by the
+// time a row reaches the browser.
+const communityPostColumns = "id,number_e164,category,title,body,evidence_url,author_alias,author_user_id,evidence_public_id,up_count,down_count,score,comment_count,created_at,status"
+const communityCommentColumns = "id,post_id,parent_id,body,author_alias,author_user_id,created_at"
+
+// phoneReportColumns is read only by the moderation queue, which is the single place allowed to
+// see reported_by. The handler turns that account id into an alias before the row leaves the API.
+const phoneReportColumns = "id,number_e164,category,source,status,note,evidence_url,reported_by,created_at"
 
 type dataStore interface {
 	InsertScan(ctx context.Context, row map[string]any) error
@@ -65,16 +179,27 @@ type dataStore interface {
 	InsertCommunityPost(ctx context.Context, row map[string]any) error
 	ListCommunityPosts(ctx context.Context, filter postFilter) ([]map[string]any, error)
 	GetCommunityPost(ctx context.Context, postID string) (map[string]any, bool, error)
+	DeleteCommunityPost(ctx context.Context, postID, userID string) (bool, error)
 	CastCommunityVote(ctx context.Context, postID, userID string, value int) (map[string]any, bool, error)
 	CommunityVotesBy(ctx context.Context, userID string, postIDs []string) (map[string]int, error)
 	InsertCommunityComment(ctx context.Context, row map[string]any) error
 	GetCommunityComment(ctx context.Context, postID, commentID string) (map[string]any, bool, error)
 	ListCommunityComments(ctx context.Context, postID string, limit, offset int) ([]map[string]any, error)
+	DeleteCommunityComment(ctx context.Context, postID, commentID, userID string) (bool, error)
 	DangerousNumbers(ctx context.Context, limit, offset int) ([]map[string]any, error)
 
 	GetSession(ctx context.Context, userID, sessionID string) (*sessionInfo, bool, error)
 	TouchSession(ctx context.Context, userID, sessionID string, at time.Time) error
 	RevokeSessionByID(ctx context.Context, id, reason string) error
+	GetUserRole(ctx context.Context, userID string) (string, error)
+	ListCommunityPostsAdmin(ctx context.Context, filter queueFilter) ([]map[string]any, error)
+	UpdateCommunityPostStatus(ctx context.Context, postID, status string) (bool, error)
+	CountCommunityPostsAdmin(ctx context.Context, filter queueFilter) (int, error)
+	ListPhoneReportsAdmin(ctx context.Context, filter queueFilter) ([]map[string]any, error)
+	GetPhoneReportAdmin(ctx context.Context, reportID string) (map[string]any, bool, error)
+	CountPhoneReportsAdmin(ctx context.Context, filter queueFilter) (int, error)
+	DeskStats(ctx context.Context, rng string) (map[string]any, error)
+
 	RevokeSessionByToken(ctx context.Context, userID, sessionID, reason string) error
 	SessionExists(ctx context.Context, sessionID string) (bool, error)
 	InsertSession(ctx context.Context, userID, sessionID, ip, userAgent string) error
@@ -211,6 +336,18 @@ func (r *restStore) GetCommunityPost(ctx context.Context, postID string) (map[st
 	return rows[0], true, nil
 }
 
+// DeleteCommunityPost erases one post for good. The ownership test is part of the filter rather
+// than a check in front of it: "this id AND this author" cannot be talked into deleting somebody
+// else's row, and somebody else's post simply answers "nothing was deleted".
+func (r *restStore) DeleteCommunityPost(ctx context.Context, postID, userID string) (bool, error) {
+	path := "/rest/v1/community_posts?id=eq." + url.QueryEscape(postID) + "&author_user_id=eq." + url.QueryEscape(userID)
+	var rows []map[string]any
+	if err := r.call(ctx, http.MethodDelete, path, nil, &rows); err != nil {
+		return false, err
+	}
+	return len(rows) > 0, nil
+}
+
 // CastCommunityVote runs the one-statement RPC: an upsert keyed on (post_id, user_id) cannot be
 // expressed over REST without a transaction, and two clicks arriving together would otherwise be
 // able to write two rows.
@@ -280,6 +417,20 @@ func (r *restStore) ListCommunityComments(ctx context.Context, postID string, li
 	return rows, nil
 }
 
+// DeleteCommunityComment erases one comment for good. The comment's own replies go with it, because
+// parent_id is declared on delete cascade — which is why the confirmation dialog says so out loud
+// instead of letting somebody discover it after the click.
+func (r *restStore) DeleteCommunityComment(ctx context.Context, postID, commentID, userID string) (bool, error) {
+	path := "/rest/v1/community_comments?id=eq." + url.QueryEscape(commentID) +
+		"&post_id=eq." + url.QueryEscape(postID) +
+		"&author_user_id=eq." + url.QueryEscape(userID)
+	var rows []map[string]any
+	if err := r.call(ctx, http.MethodDelete, path, nil, &rows); err != nil {
+		return false, err
+	}
+	return len(rows) > 0, nil
+}
+
 func (r *restStore) DangerousNumbers(ctx context.Context, limit, offset int) ([]map[string]any, error) {
 	path := "/rest/v1/dangerous_numbers?select=*&order=verified_reports.desc,last_report_at.desc" +
 		fmt.Sprintf("&limit=%d&offset=%d", limit, offset)
@@ -288,6 +439,147 @@ func (r *restStore) DangerousNumbers(ctx context.Context, limit, offset int) ([]
 		return nil, err
 	}
 	return rows, nil
+}
+func (r *restStore) GetUserRole(ctx context.Context, userID string) (string, error) {
+	path := "/rest/v1/profiles?select=role&id=eq." + url.QueryEscape(userID) + "&limit=1"
+	var rows []map[string]any
+	if err := r.call(ctx, "GET", path, nil, &rows); err != nil {
+		return "", err
+	}
+	if len(rows) == 0 {
+		return "user", nil
+	}
+	if role, ok := rows[0]["role"].(string); ok {
+		return role, nil
+	}
+	return "user", nil
+}
+
+func (r *restStore) ListCommunityPostsAdmin(ctx context.Context, filter queueFilter) ([]map[string]any, error) {
+	path := "/rest/v1/community_posts?select=" + communityPostColumns + "&order=created_at.desc" +
+		filter.rest(communityPostSearchCols...) + pageQuery(filter.Limit, filter.Offset)
+	var rows []map[string]any
+	if err := r.call(ctx, "GET", path, nil, &rows); err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
+func (r *restStore) UpdateCommunityPostStatus(ctx context.Context, postID, status string) (bool, error) {
+	path := "/rest/v1/community_posts?id=eq." + url.QueryEscape(postID)
+	// supabase() already asks PostgREST for the patched rows back, so one round trip both writes
+	// and answers "did that id exist" — an empty result means it did not.
+	var rows []map[string]any
+	if err := r.call(ctx, "PATCH", path, map[string]any{"status": status}, &rows); err != nil {
+		return false, err
+	}
+	return len(rows) > 0, nil
+}
+
+func (r *restStore) CountCommunityPostsAdmin(ctx context.Context, filter queueFilter) (int, error) {
+	return r.total(ctx, "/rest/v1/community_posts?select=id"+filter.rest(communityPostSearchCols...))
+}
+
+func (r *restStore) ListPhoneReportsAdmin(ctx context.Context, filter queueFilter) ([]map[string]any, error) {
+	path := "/rest/v1/phone_reports?select=" + phoneReportColumns + "&order=created_at.desc" +
+		filter.rest(phoneReportSearchCols...) + pageQuery(filter.Limit, filter.Offset)
+	var rows []map[string]any
+	if err := r.call(ctx, "GET", path, nil, &rows); err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
+func (r *restStore) GetPhoneReportAdmin(ctx context.Context, reportID string) (map[string]any, bool, error) {
+	path := "/rest/v1/phone_reports?select=" + phoneReportColumns + "&id=eq." + url.QueryEscape(reportID) + "&limit=1"
+	var rows []map[string]any
+	if err := r.call(ctx, "GET", path, nil, &rows); err != nil {
+		return nil, false, err
+	}
+	if len(rows) == 0 {
+		return nil, false, nil
+	}
+	return rows[0], true, nil
+}
+
+func (r *restStore) CountPhoneReportsAdmin(ctx context.Context, filter queueFilter) (int, error) {
+	return r.total(ctx, "/rest/v1/phone_reports?select=id"+filter.rest(phoneReportSearchCols...))
+}
+
+// DeskStats asks Postgres for the whole console dashboard in one call. Two roads are closed:
+// PostgREST cannot group by a truncated date, and pulling the raw rows here to count them in Go
+// would run into the 1 MiB cap supabase() puts on every response, which turns a missing month
+// into a quiet zero rather than an error. admin_desk_stats() does the arithmetic in the database
+// and hands back one jsonb object.
+//
+// The answer is read as bytes rather than straight into a map because PostgREST does not wrap a
+// function that returns jsonb in a row set: the body is the object itself. A function returning a
+// composite or a set of rows does come back as an array, so both shapes are accepted and neither
+// one is allowed to pass as an empty dashboard.
+func (r *restStore) DeskStats(ctx context.Context, rng string) (map[string]any, error) {
+	var raw json.RawMessage
+	if err := r.call(ctx, "POST", "/rest/v1/rpc/admin_desk_stats", map[string]any{"p_range": rng}, &raw); err != nil {
+		return nil, err
+	}
+	body := strings.TrimSpace(string(raw))
+	if body == "" {
+		return nil, errors.New("desk stats returned no row")
+	}
+	if strings.HasPrefix(body, "[") {
+		var rows []map[string]any
+		if err := json.Unmarshal([]byte(body), &rows); err != nil {
+			return nil, err
+		}
+		if len(rows) == 0 {
+			return nil, errors.New("desk stats returned no row")
+		}
+		return rows[0], nil
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(body), &payload); err != nil {
+		return nil, err
+	}
+	return payload, nil
+}
+
+// pageQuery is the paging tail every queue list sends, kept in one place so a queue can never page
+// with a limit the count did not see.
+func pageQuery(limit, offset int) string {
+	return "&limit=" + strconv.Itoa(limit) + "&offset=" + strconv.Itoa(offset)
+}
+
+// total counts the rows a filter matches. PostgREST reports it in the Content-Range header of a
+// HEAD request, so no body is fetched; a response without that header is an error the caller
+// decides how to degrade, never a silent zero.
+func (r *restStore) total(ctx context.Context, path string) (int, error) {
+	if r.server.cfg.supabaseURL == "" {
+		return 0, errors.New("supabase URL missing")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, r.server.cfg.supabaseURL+path, nil)
+	if err != nil {
+		return 0, err
+	}
+	key := r.server.cfg.secretKey
+	req.Header.Set("apikey", key)
+	req.Header.Set("Authorization", "Bearer "+key)
+	req.Header.Set("Prefer", "count=exact")
+	resp, err := r.server.client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return 0, fmt.Errorf("count returned status %d", resp.StatusCode)
+	}
+	_, after, ok := strings.Cut(resp.Header.Get("Content-Range"), "/")
+	if !ok {
+		return 0, errors.New("count header missing")
+	}
+	total, err := strconv.Atoi(strings.TrimSpace(after))
+	if err != nil || total < 0 {
+		return 0, fmt.Errorf("count header %q unreadable", after)
+	}
+	return total, nil
 }
 
 func (r *restStore) GetSession(ctx context.Context, userID, sessionID string) (*sessionInfo, bool, error) {
@@ -594,6 +886,7 @@ func (p *pgxStore) InsertCommunityPost(ctx context.Context, row map[string]any) 
 func (p *pgxStore) ListCommunityPosts(ctx context.Context, filter postFilter) ([]map[string]any, error) {
 	args := []any{filter.Limit, filter.Offset}
 	sql := `select id, number_e164, category, title, body, evidence_url, author_alias,
+	               author_user_id, evidence_public_id,
 	               up_count, down_count, score, comment_count, created_at, status
 	          from public.community_posts
 	         where status = 'active'`
@@ -620,6 +913,7 @@ func (p *pgxStore) ListCommunityPosts(ctx context.Context, filter postFilter) ([
 	for rows.Next() {
 		var row postFields
 		if err := rows.Scan(&row.id, &row.number, &row.category, &row.title, &row.body, &row.evidence, &row.alias,
+			&row.authorID, &row.evidenceID,
 			&row.up, &row.down, &row.score, &row.comments, &row.createdAt, &row.state); err != nil {
 			return nil, err
 		}
@@ -632,9 +926,11 @@ func (p *pgxStore) GetCommunityPost(ctx context.Context, postID string) (map[str
 	var row postFields
 	err := p.pool.QueryRow(ctx,
 		`select id, number_e164, category, title, body, evidence_url, author_alias,
+		        author_user_id, evidence_public_id,
 		        up_count, down_count, score, comment_count, created_at, status
 		   from public.community_posts where id = $1::uuid`, postID).
 		Scan(&row.id, &row.number, &row.category, &row.title, &row.body, &row.evidence, &row.alias,
+			&row.authorID, &row.evidenceID,
 			&row.up, &row.down, &row.score, &row.comments, &row.createdAt, &row.state)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -643,6 +939,18 @@ func (p *pgxStore) GetCommunityPost(ctx context.Context, postID string) (map[str
 		return nil, false, err
 	}
 	return postRecord(row), true, nil
+}
+
+// DeleteCommunityPost erases one post for good. Ownership is part of the predicate, not a check in
+// front of it, so somebody else's row simply answers "nothing was deleted" instead of "forbidden".
+// Votes and comments go with it: both reference this table on delete cascade.
+func (p *pgxStore) DeleteCommunityPost(ctx context.Context, postID, userID string) (bool, error) {
+	tag, err := p.pool.Exec(ctx,
+		`delete from public.community_posts where id = $1::uuid and author_user_id = $2::uuid`, postID, userID)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
 }
 
 func (p *pgxStore) CastCommunityVote(ctx context.Context, postID, userID string, value int) (map[string]any, bool, error) {
@@ -699,27 +1007,27 @@ func (p *pgxStore) InsertCommunityComment(ctx context.Context, row map[string]an
 
 func (p *pgxStore) GetCommunityComment(ctx context.Context, postID, commentID string) (map[string]any, bool, error) {
 	var (
-		id, body, alias string
-		parentID        *string
-		createdAt       time.Time
+		id, body, alias, authorID string
+		parentID                  *string
+		createdAt                 time.Time
 	)
 	err := p.pool.QueryRow(ctx,
-		`select id, post_id, parent_id, body, author_alias, created_at
+		`select id, post_id, parent_id, body, author_alias, author_user_id, created_at
 		   from public.community_comments
 		  where id = $1::uuid and post_id = $2::uuid and status = 'active'`, commentID, postID).
-		Scan(&id, &postID, &parentID, &body, &alias, &createdAt)
+		Scan(&id, &postID, &parentID, &body, &alias, &authorID, &createdAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, false, nil
 		}
 		return nil, false, err
 	}
-	return commentRecord(id, postID, parentID, body, alias, createdAt), true, nil
+	return commentRecord(id, postID, parentID, body, alias, authorID, createdAt), true, nil
 }
 
 func (p *pgxStore) ListCommunityComments(ctx context.Context, postID string, limit, offset int) ([]map[string]any, error) {
 	rows, err := p.pool.Query(ctx,
-		`select id, post_id, parent_id, body, author_alias, created_at
+		`select id, post_id, parent_id, body, author_alias, author_user_id, created_at
 		   from public.community_comments
 		  where post_id = $1::uuid and status = 'active'
 		  order by created_at asc limit $2 offset $3`, postID, limit, offset)
@@ -730,16 +1038,29 @@ func (p *pgxStore) ListCommunityComments(ctx context.Context, postID string, lim
 	result := make([]map[string]any, 0, limit)
 	for rows.Next() {
 		var (
-			id, related, body, alias string
-			parentID                 *string
-			createdAt                time.Time
+			id, related, body, alias, authorID string
+			parentID                           *string
+			createdAt                          time.Time
 		)
-		if err := rows.Scan(&id, &related, &parentID, &body, &alias, &createdAt); err != nil {
+		if err := rows.Scan(&id, &related, &parentID, &body, &alias, &authorID, &createdAt); err != nil {
 			return nil, err
 		}
-		result = append(result, commentRecord(id, related, parentID, body, alias, createdAt))
+		result = append(result, commentRecord(id, related, parentID, body, alias, authorID, createdAt))
 	}
 	return result, rows.Err()
+}
+
+// DeleteCommunityComment mirrors the REST path: ownership sits inside the predicate, so another
+// account's comment simply answers "nothing was deleted".
+func (p *pgxStore) DeleteCommunityComment(ctx context.Context, postID, commentID, userID string) (bool, error) {
+	tag, err := p.pool.Exec(ctx,
+		`delete from public.community_comments
+		  where id = $1::uuid and post_id = $2::uuid and author_user_id = $3::uuid`,
+		commentID, postID, userID)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
 }
 
 func (p *pgxStore) DangerousNumbers(ctx context.Context, limit, offset int) ([]map[string]any, error) {
@@ -776,6 +1097,137 @@ func (p *pgxStore) DangerousNumbers(ctx context.Context, limit, offset int) ([]m
 
 // moment keeps the two stores producing the same JSON: PostgREST already hands back timestamp
 // strings, so the direct-database path formats them the same way instead of shipping Go's own.
+
+func (p *pgxStore) GetUserRole(ctx context.Context, userID string) (string, error) {
+	var role string
+	err := p.pool.QueryRow(ctx, `select role from public.profiles where id = $1::uuid`, userID).Scan(&role)
+	if err != nil {
+		return "user", nil
+	}
+	return role, nil
+}
+
+func (p *pgxStore) ListCommunityPostsAdmin(ctx context.Context, filter queueFilter) ([]map[string]any, error) {
+	sql := `select id, number_e164, category, title, body, evidence_url, author_alias,
+	               author_user_id, evidence_public_id,
+	               up_count, down_count, score, comment_count, created_at, status
+	          from public.community_posts`
+	where, args := filter.where(3, communityPostSearchCols...)
+	sql += where + ` order by created_at desc limit $1 offset $2`
+	rows, err := p.pool.Query(ctx, sql, append([]any{filter.Limit, filter.Offset}, args...)...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var results []map[string]any
+	for rows.Next() {
+		var row postFields
+		if err := rows.Scan(&row.id, &row.number, &row.category, &row.title, &row.body, &row.evidence, &row.alias,
+			&row.authorID, &row.evidenceID,
+			&row.up, &row.down, &row.score, &row.comments, &row.createdAt, &row.state); err != nil {
+			return nil, err
+		}
+		results = append(results, postRecord(row))
+	}
+	return results, rows.Err()
+}
+
+func (p *pgxStore) UpdateCommunityPostStatus(ctx context.Context, postID, status string) (bool, error) {
+	tag, err := p.pool.Exec(ctx, `update public.community_posts set status = $2 where id = $1::uuid`, postID, status)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
+func (p *pgxStore) CountCommunityPostsAdmin(ctx context.Context, filter queueFilter) (int, error) {
+	return p.count(ctx, "public.community_posts", filter, communityPostSearchCols...)
+}
+
+func (p *pgxStore) CountPhoneReportsAdmin(ctx context.Context, filter queueFilter) (int, error) {
+	return p.count(ctx, "public.phone_reports", filter, phoneReportSearchCols...)
+}
+
+func (p *pgxStore) count(ctx context.Context, table string, filter queueFilter, columns ...string) (int, error) {
+	where, args := filter.where(1, columns...)
+	var total int
+	err := p.pool.QueryRow(ctx, "select count(*) from "+table+where, args...).Scan(&total)
+	return total, err
+}
+
+func (p *pgxStore) ListPhoneReportsAdmin(ctx context.Context, filter queueFilter) ([]map[string]any, error) {
+	sql := `select id, number_e164, category, source, status,
+	               coalesce(note, ''), coalesce(evidence_url, ''),
+	               coalesce(reported_by::text, ''), created_at
+	          from public.phone_reports`
+	where, args := filter.where(3, phoneReportSearchCols...)
+	sql += where + " order by created_at desc limit $1 offset $2"
+	rows, err := p.pool.Query(ctx, sql, append([]any{filter.Limit, filter.Offset}, args...)...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	results := []map[string]any{}
+	for rows.Next() {
+		var row phoneReportFields
+		if err := rows.Scan(&row.id, &row.number, &row.category, &row.source, &row.state,
+			&row.note, &row.evidence, &row.reporter, &row.createdAt); err != nil {
+			return nil, err
+		}
+		results = append(results, phoneReportRecord(row))
+	}
+	return results, rows.Err()
+}
+
+func (p *pgxStore) GetPhoneReportAdmin(ctx context.Context, reportID string) (map[string]any, bool, error) {
+	var row phoneReportFields
+	err := p.pool.QueryRow(ctx,
+		`select id, number_e164, category, source, status,
+		        coalesce(note, ''), coalesce(evidence_url, ''),
+		        coalesce(reported_by::text, ''), created_at
+		   from public.phone_reports where id = $1::uuid`, reportID).Scan(
+		&row.id, &row.number, &row.category, &row.source, &row.state,
+		&row.note, &row.evidence, &row.reporter, &row.createdAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	return phoneReportRecord(row), true, nil
+}
+
+// DeskStats runs the same database function the PostgREST path calls, but reads its jsonb straight
+// out of a single column instead of through an HTTP wrapper.
+func (p *pgxStore) DeskStats(ctx context.Context, rng string) (map[string]any, error) {
+	var raw []byte
+	if err := p.pool.QueryRow(ctx, `select public.admin_desk_stats($1)`, rng).Scan(&raw); err != nil {
+		return nil, err
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return nil, err
+	}
+	return payload, nil
+}
+
+// phoneReportFields is one scanned phone_reports row; phoneReportRecord gives it the same JSON shape the
+// PostgREST path returns, including the reported_by the moderation handler then replaces.
+type phoneReportFields struct {
+	id, number, category, source, state, note, evidence, reporter string
+	createdAt                                                     time.Time
+}
+
+func phoneReportRecord(row phoneReportFields) map[string]any {
+	return map[string]any{
+		"id": row.id, "number_e164": row.number, "category": row.category, "source": row.source,
+		"status": row.state, "note": row.note, "evidence_url": row.evidence,
+		"reported_by": row.reporter, "created_at": moment(row.createdAt),
+	}
+}
+
 func moment(value time.Time) string {
 	return value.UTC().Format(time.RFC3339)
 }
@@ -783,23 +1235,25 @@ func moment(value time.Time) string {
 // postFields is one scanned community_posts row; postRecord gives it the same JSON shape the
 // PostgREST path returns, so the handlers never learn which store answered.
 type postFields struct {
-	id, number, category, title, body, evidence, alias, state string
-	up, down, score, comments                                 int
-	createdAt                                                 time.Time
+	id, number, category, title, body, evidence, alias, authorID, evidenceID, state string
+	up, down, score, comments                                                       int
+	createdAt                                                                       time.Time
 }
 
 func postRecord(row postFields) map[string]any {
 	return map[string]any{
 		"id": row.id, "number_e164": row.number, "category": row.category, "title": row.title,
 		"body": row.body, "evidence_url": row.evidence, "author_alias": row.alias,
+		"author_user_id": row.authorID, "evidence_public_id": row.evidenceID,
 		"up_count": row.up, "down_count": row.down, "score": row.score,
 		"comment_count": row.comments, "created_at": moment(row.createdAt), "status": row.state,
 	}
 }
 
-func commentRecord(id, postID string, parentID *string, body, alias string, createdAt time.Time) map[string]any {
+func commentRecord(id, postID string, parentID *string, body, alias, authorID string, createdAt time.Time) map[string]any {
 	record := map[string]any{
-		"id": id, "post_id": postID, "body": body, "author_alias": alias, "created_at": moment(createdAt),
+		"id": id, "post_id": postID, "body": body, "author_alias": alias,
+		"author_user_id": authorID, "created_at": moment(createdAt),
 	}
 	if parentID != nil {
 		record["parent_id"] = *parentID

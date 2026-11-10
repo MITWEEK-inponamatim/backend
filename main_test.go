@@ -25,6 +25,20 @@ func TestRejectsUnsignedJWT(t *testing.T) {
 	}
 }
 
+// The desk writes its decisions with PATCH. A method missing from the preflight answer is refused by
+// the browser, so no request ever reaches a handler and no other test in this file can notice.
+func TestPreflightAllowsDecisionMethod(t *testing.T) {
+	server := &server{cfg: config{origins: "http://localhost:3000"}}
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodOptions, "/api/v1/admin/community/reports/6f6f6f6f/status", nil)
+	request.Header.Set("Origin", "http://localhost:3000")
+	request.Header.Set("Access-Control-Request-Method", http.MethodPatch)
+	server.corsAndSecurity(http.NotFoundHandler()).ServeHTTP(recorder, request)
+	if methods := recorder.Header().Get("Access-Control-Allow-Methods"); !strings.Contains(methods, http.MethodPatch) {
+		t.Fatalf("preflight answers %q, the moderation desk writes with PATCH", methods)
+	}
+}
+
 func TestRejectsFakeAPKZip(t *testing.T) {
 	if _, ok := detectApkType(".apk", []byte("PK\x03\x04not-a-zip")); ok {
 		t.Fatal("fake APK accepted")

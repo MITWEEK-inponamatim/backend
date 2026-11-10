@@ -21,30 +21,55 @@ type stubStore struct {
 	failFirst         bool
 
 	// Community rows the handlers under test read back.
-	postInserts    []map[string]any
-	postErr        error
-	postRows       []map[string]any
-	postListErr    error
-	postRow        map[string]any
-	postFound      bool
-	postGetErr     error
-	lastFilter     postFilter
-	voteCalls      []map[string]any
-	voteRow        map[string]any
-	voteFound      bool
-	voteErr        error
-	votes          map[string]int
-	commentRows    []map[string]any
-	commentInserts []map[string]any
-	commentErr     error
-	parentRow      map[string]any
-	parentFound    bool
-	dangerousRows  []map[string]any
-	dangerousErr   error
+	postInserts     []map[string]any
+	postErr         error
+	postRows        []map[string]any
+	postListErr     error
+	postRow         map[string]any
+	postFound       bool
+	postGetErr      error
+	postDeleteCalls []map[string]any
+	postDeleted     bool
+	postDeleteErr   error
+	lastFilter      postFilter
+	voteCalls       []map[string]any
+	voteRow         map[string]any
+	voteFound       bool
+	voteErr         error
+	votes           map[string]int
+	commentRows     []map[string]any
+	commentInserts  []map[string]any
+	commentErr      error
+	commentDeletes  []map[string]any
+	commentDeleted  bool
+	commentDeleteEr error
+	parentRow       map[string]any
+	parentFound     bool
+	dangerousRows   []map[string]any
+	dangerousErr    error
 
 	// History list rows, and the filter the handler passed down.
 	scanRows      []any
 	listScanTypes []string
+
+	// Admin moderation: the role the gate reads, the rows both queues list, and the filter each
+	// queue was asked for.
+	role           string
+	roleErr        error
+	adminPostRows  []map[string]any
+	adminPostTotal int
+	postFilter     queueFilter
+	postStatusSet  []map[string]any
+	reportRows     []map[string]any
+	reportTotal    int
+	reportFilter   queueFilter
+	reportRow      map[string]any
+	reportFound    bool
+
+	// Dashboard aggregate: the range the handler asked for, and the payload the store returns.
+	statsRange   string
+	statsPayload map[string]any
+	statsErr     error
 }
 
 func (f *stubStore) InsertScan(context.Context, map[string]any) error { return nil }
@@ -114,6 +139,11 @@ func (f *stubStore) GetCommunityPost(context.Context, string) (map[string]any, b
 	return f.postRow, f.postFound, f.postGetErr
 }
 
+func (f *stubStore) DeleteCommunityPost(_ context.Context, postID, userID string) (bool, error) {
+	f.postDeleteCalls = append(f.postDeleteCalls, map[string]any{"post_id": postID, "user_id": userID})
+	return f.postDeleted, f.postDeleteErr
+}
+
 func (f *stubStore) CastCommunityVote(_ context.Context, postID, _ string, value int) (map[string]any, bool, error) {
 	f.voteCalls = append(f.voteCalls, map[string]any{"post_id": postID, "value": value})
 	return f.voteRow, f.voteFound, f.voteErr
@@ -139,8 +169,57 @@ func (f *stubStore) ListCommunityComments(context.Context, string, int, int) ([]
 	return f.commentRows, nil
 }
 
+func (f *stubStore) DeleteCommunityComment(_ context.Context, postID, commentID, userID string) (bool, error) {
+	f.commentDeletes = append(f.commentDeletes,
+		map[string]any{"post_id": postID, "comment_id": commentID, "user_id": userID})
+	return f.commentDeleted, f.commentDeleteEr
+}
+
 func (f *stubStore) DangerousNumbers(context.Context, int, int) ([]map[string]any, error) {
 	return f.dangerousRows, f.dangerousErr
+}
+
+func (f *stubStore) GetUserRole(context.Context, string) (string, error) {
+	if f.roleErr != nil {
+		return "", f.roleErr
+	}
+	if f.role == "" {
+		return "user", nil
+	}
+	return f.role, nil
+}
+
+func (f *stubStore) ListCommunityPostsAdmin(_ context.Context, filter queueFilter) ([]map[string]any, error) {
+	f.postFilter = filter
+	return f.adminPostRows, nil
+}
+
+func (f *stubStore) UpdateCommunityPostStatus(_ context.Context, postID, status string) (bool, error) {
+	f.postStatusSet = append(f.postStatusSet, map[string]any{"post_id": postID, "status": status})
+	return len(f.adminPostRows) > 0, nil
+}
+
+func (f *stubStore) ListPhoneReportsAdmin(_ context.Context, filter queueFilter) ([]map[string]any, error) {
+	f.reportFilter = filter
+	return f.reportRows, nil
+}
+
+func (f *stubStore) GetPhoneReportAdmin(context.Context, string) (map[string]any, bool, error) {
+	return f.reportRow, f.reportFound, nil
+}
+
+func (f *stubStore) CountPhoneReportsAdmin(_ context.Context, filter queueFilter) (int, error) {
+	f.reportFilter = filter
+	return f.reportTotal, nil
+}
+func (f *stubStore) DeskStats(_ context.Context, rng string) (map[string]any, error) {
+	f.statsRange = rng
+	return f.statsPayload, f.statsErr
+}
+
+func (f *stubStore) CountCommunityPostsAdmin(_ context.Context, filter queueFilter) (int, error) {
+	f.postFilter = filter
+	return f.adminPostTotal, nil
 }
 
 func (f *stubStore) Kind() string { return "stub" }
@@ -151,10 +230,12 @@ const testUserID = "8b1c2d3e-4f50-4a6b-8c7d-9e0f1a2b3c4d"
 // analysisStub stands in for the Python service: it normalises numbers the same way (only the
 // +62 shape decides scope, validity never blocks a report) and it keeps or refuses evidence.
 type analysisStub struct {
-	normalized string
-	refuse     bool
-	stored     []map[string]any
-	destroyed  []string
+	normalized       string
+	refuse           bool
+	refuseModeration bool
+	stored           []map[string]any
+	destroyed        []string
+	moderations      []map[string]string
 }
 
 // newReportServer wires the handler under test to both internal endpoints it calls.
@@ -191,6 +272,18 @@ func newReportServer(t *testing.T, store *stubStore, stub *analysisStub) *server
 			_ = json.NewDecoder(r.Body).Decode(&body)
 			stub.destroyed = append(stub.destroyed, body.PublicID)
 			_ = json.NewEncoder(w).Encode(map[string]any{"deleted": true})
+		case r.Method == http.MethodPatch && strings.HasPrefix(r.URL.Path, "/internal/v1/phone-reports/"):
+			var body struct {
+				Status string `json:"status"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			reportID := strings.TrimPrefix(r.URL.Path, "/internal/v1/phone-reports/")
+			stub.moderations = append(stub.moderations, map[string]string{"id": reportID, "status": body.Status})
+			if stub.refuseModeration {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": reportID, "status": body.Status})
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}

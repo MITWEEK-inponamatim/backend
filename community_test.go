@@ -493,6 +493,209 @@ func TestGetCommunityPostNotFoundForUnknownOrMalformedID(t *testing.T) {
 	}
 }
 
+// An author erasing their own story is the one delete allowed here, and it has to take the
+// screenshot with it: a row nobody can find but an image still served is a leak waiting for a URL.
+func TestDeleteCommunityPostErasesRowAndEvidence(t *testing.T) {
+	publicID := "threatlens/phone-reports/" + testUserID + "/evidence-rand"
+	stub := &analysisStub{normalized: "+6281234567890"}
+	store := &stubStore{
+		postFound:   true,
+		postRow:     map[string]any{"id": communityPostID, "status": "active", "author_user_id": testUserID, "evidence_public_id": publicID},
+		postDeleted: true,
+	}
+	s := newReportServer(t, store, stub)
+	request := withIdentity(httptest.NewRequest(http.MethodDelete, "/api/v1/community/posts/"+communityPostID, nil), testUserID)
+	recorder := httptest.NewRecorder()
+	s.deleteCommunityPost(recorder, withPostID(request, communityPostID))
+
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if len(store.postDeleteCalls) != 1 || store.postDeleteCalls[0]["user_id"] != testUserID {
+		t.Fatalf("delete not asked under the caller's own id: %v", store.postDeleteCalls)
+	}
+	if len(stub.destroyed) != 1 || stub.destroyed[0] != publicID {
+		t.Fatalf("evidence left in storage: %v", stub.destroyed)
+	}
+}
+
+// Somebody else's story answers exactly like a missing one, and its screenshot stays untouched.
+func TestDeleteCommunityPostOfAnotherAccountRevealsNothing(t *testing.T) {
+	other := "1b1c2d3e-4f50-4a6b-8c7d-9e0f1a2b3c4d"
+	stub := &analysisStub{normalized: "+6281234567890"}
+	store := &stubStore{
+		postFound: true,
+		postRow: map[string]any{"id": communityPostID, "status": "active",
+			"author_user_id": other, "evidence_public_id": "threatlens/phone-reports/other/evidence"},
+	}
+	s := newReportServer(t, store, stub)
+	request := withIdentity(httptest.NewRequest(http.MethodDelete, "/api/v1/community/posts/"+communityPostID, nil), testUserID)
+	recorder := httptest.NewRecorder()
+	s.deleteCommunityPost(recorder, withPostID(request, communityPostID))
+
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if len(store.postDeleteCalls) != 1 || store.postDeleteCalls[0]["user_id"] != testUserID {
+		t.Fatalf("delete not asked under the caller's own id: %v", store.postDeleteCalls)
+	}
+	if len(stub.destroyed) != 0 {
+		t.Fatalf("another account's evidence destroyed: %v", stub.destroyed)
+	}
+}
+
+func TestDeleteCommunityPostRefusesMalformedIDAndKeepsItsOwnFailuresQuiet(t *testing.T) {
+	store := &stubStore{postFound: true, postDeleted: true}
+	s := communityServer(t, store, "+6281234567890")
+	request := withIdentity(httptest.NewRequest(http.MethodDelete, "/api/v1/community/posts/not-a-uuid", nil), testUserID)
+	recorder := httptest.NewRecorder()
+	s.deleteCommunityPost(recorder, withPostID(request, "not-a-uuid"))
+	if recorder.Code != http.StatusNotFound || len(store.postDeleteCalls) != 0 {
+		t.Fatalf("status = %d, delete calls = %v", recorder.Code, store.postDeleteCalls)
+	}
+
+	failing := &stubStore{postFound: true, postRow: map[string]any{"id": communityPostID, "status": "active"}, postDeleteErr: errors.New("connection reset")}
+	s2 := communityServer(t, failing, "+6281234567890")
+	recorder2 := httptest.NewRecorder()
+	s2.deleteCommunityPost(recorder2, withPostID(withIdentity(httptest.NewRequest(http.MethodDelete, "/api/v1/community/posts/"+communityPostID, nil), testUserID), communityPostID))
+	if recorder2.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, body = %s", recorder2.Code, recorder2.Body.String())
+	}
+}
+
+func TestCommunityFeedNeverCarriesAccountIDOrEvidenceKey(t *testing.T) {
+	other := "1b1c2d3e-4f50-4a6b-8c7d-9e0f1a2b3c4d"
+	store := &stubStore{postRows: []map[string]any{
+		{"id": communityPostID, "title": "Punya saya", "author_user_id": testUserID, "evidence_public_id": "threatlens/phone-reports/mine/a"},
+		{"id": other, "title": "Punya orang lain", "author_user_id": other, "evidence_public_id": "threatlens/phone-reports/theirs/b"},
+	}}
+	s := communityServer(t, store, "+6281234567890")
+	request := withIdentity(httptest.NewRequest(http.MethodGet, "/api/v1/community/posts", nil), testUserID)
+	recorder := httptest.NewRecorder()
+	s.listCommunityPosts(recorder, request)
+
+	body := recorder.Body.String()
+	if strings.Contains(body, "author_user_id") || strings.Contains(body, "evidence_public_id") {
+		t.Fatalf("private columns reached the browser: %s", body)
+	}
+	var payload struct {
+		Posts []map[string]any `json:"posts"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("body: %s", recorder.Body.String())
+	}
+	if payload.Posts[0]["is_author"] != true || payload.Posts[1]["is_author"] != false {
+		t.Fatalf("is_author not stamped per row: %v", payload.Posts)
+	}
+}
+
+// commentRequest mimics the two path values ServeMux fills for
+// /api/v1/community/posts/{postID}/comments/{commentID}.
+func commentRequest(userID, postID, commentID string) *http.Request {
+	request := withIdentity(httptest.NewRequest(http.MethodDelete,
+		"/api/v1/community/posts/"+postID+"/comments/"+commentID, nil), userID)
+	request.SetPathValue("postID", postID)
+	request.SetPathValue("commentID", commentID)
+	return request
+}
+
+// Erasing your own comment is allowed; erasing somebody else's is not, and both the missing comment
+// and the foreign one answer the same way so this route cannot be walked to learn who wrote what.
+func TestDeleteCommunityCommentOnlyAnsweredToItsAuthor(t *testing.T) {
+	const commentID = "2c2d3e4f-5061-4b7c-8d9e-0f1a2b3c4d5e"
+
+	store := &stubStore{commentDeleted: true}
+	s := communityServer(t, store, "+6281234567890")
+	recorder := httptest.NewRecorder()
+	s.deleteCommunityComment(recorder, commentRequest(testUserID, communityPostID, commentID))
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if len(store.commentDeletes) != 1 {
+		t.Fatalf("delete calls = %v", store.commentDeletes)
+	}
+	if call := store.commentDeletes[0]; call["post_id"] != communityPostID || call["comment_id"] != commentID || call["user_id"] != testUserID {
+		t.Fatalf("delete not scoped to the caller's own comment: %v", call)
+	}
+
+	// The store's predicate found no row, because the comment belongs to another account.
+	foreign := &stubStore{}
+	s2 := communityServer(t, foreign, "+6281234567890")
+	recorder2 := httptest.NewRecorder()
+	s2.deleteCommunityComment(recorder2, commentRequest(testUserID, communityPostID, commentID))
+	if recorder2.Code != http.StatusNotFound || len(foreign.commentDeletes) != 1 {
+		t.Fatalf("status = %d, calls = %v", recorder2.Code, foreign.commentDeletes)
+	}
+}
+
+func TestDeleteCommunityCommentRefusesMalformedIDsAndKeepsItsOwnFailuresQuiet(t *testing.T) {
+	const commentID = "2c2d3e4f-5061-4b7c-8d9e-0f1a2b3c4d5e"
+	store := &stubStore{commentDeleted: true}
+	s := communityServer(t, store, "+6281234567890")
+	for _, probe := range []struct{ postID, commentID string }{
+		{communityPostID, "not-a-uuid"},
+		{communityPostID, strings.Repeat("a", 35)},
+		{"not-a-uuid", commentID},
+	} {
+		recorder := httptest.NewRecorder()
+		s.deleteCommunityComment(recorder, commentRequest(testUserID, probe.postID, probe.commentID))
+		if recorder.Code != http.StatusNotFound {
+			t.Fatalf("post %q comment %q: status = %d", probe.postID, probe.commentID, recorder.Code)
+		}
+	}
+	if len(store.commentDeletes) != 0 {
+		t.Fatalf("malformed ids reached the store: %v", store.commentDeletes)
+	}
+
+	failing := &stubStore{commentDeleteEr: errors.New("connection reset")}
+	s2 := communityServer(t, failing, "+6281234567890")
+	recorder := httptest.NewRecorder()
+	s2.deleteCommunityComment(recorder, commentRequest(testUserID, communityPostID, commentID))
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+// Every comment row now carries an account id, which makes the thread the easiest place to leak it.
+func TestCommunityThreadNeverCarriesCommentAccountID(t *testing.T) {
+	const mine = "2c2d3e4f-5061-4b7c-8d9e-0f1a2b3c4d5e"
+	const theirs = "3d3e4f50-6172-4c8d-9e0f-1a2b3c4d5e6f"
+	store := &stubStore{
+		postFound: true,
+		postRow: map[string]any{"id": communityPostID, "title": "Satu", "status": "active",
+			"author_user_id": testUserID},
+		commentRows: []map[string]any{
+			{"id": mine, "post_id": communityPostID, "author_user_id": testUserID},
+			{"id": theirs, "post_id": communityPostID, "parent_id": mine, "author_user_id": theirs},
+		},
+	}
+	s := communityServer(t, store, "+6281234567890")
+	request := withIdentity(httptest.NewRequest(http.MethodGet, "/api/v1/community/posts/"+communityPostID, nil), testUserID)
+	recorder := httptest.NewRecorder()
+	s.getCommunityPost(recorder, withPostID(request, communityPostID))
+
+	body := recorder.Body.String()
+	if strings.Contains(body, "author_user_id") {
+		t.Fatalf("comment account ids reached the browser: %s", body)
+	}
+	var payload struct {
+		Comments []map[string]any `json:"comments"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("body: %s", body)
+	}
+	if payload.Comments[0]["is_author"] != true {
+		t.Fatalf("own comment not offered for deletion: %v", payload.Comments[0])
+	}
+	replies, _ := payload.Comments[0]["replies"].([]any)
+	if len(replies) != 1 {
+		t.Fatalf("reply missing: %v", payload.Comments)
+	}
+	if reply := replies[0].(map[string]any); reply["is_author"] != false {
+		t.Fatalf("somebody else's reply marked as mine: %v", reply)
+	}
+}
+
 func TestListDangerousNumbersReturnsViewRows(t *testing.T) {
 	store := &stubStore{dangerousRows: []map[string]any{{"number_e164": "+6281234567890", "verified_reports": 3}}}
 	s := communityServer(t, store, "+6281234567890")
@@ -525,12 +728,17 @@ func TestCommunityRoutesRequireLogin(t *testing.T) {
 	mux.Handle("GET /api/v1/community/posts", s.authenticated(http.HandlerFunc(s.listCommunityPosts)))
 	mux.Handle("POST /api/v1/community/posts", s.authenticated(http.HandlerFunc(s.createCommunityPost)))
 	mux.Handle("POST /api/v1/community/posts/{postID}/vote", s.authenticated(http.HandlerFunc(s.castCommunityVote)))
+	mux.Handle("DELETE /api/v1/community/posts/{postID}", s.authenticated(http.HandlerFunc(s.deleteCommunityPost)))
+	mux.Handle("DELETE /api/v1/community/posts/{postID}/comments/{commentID}",
+		s.authenticated(http.HandlerFunc(s.deleteCommunityComment)))
 	for _, probe := range []struct {
 		method, path string
 	}{
 		{http.MethodGet, "/api/v1/community/posts"},
 		{http.MethodPost, "/api/v1/community/posts"},
 		{http.MethodPost, "/api/v1/community/posts/8b1c2d3e-4f50-4a6b-8c7d-9e0f1a2b3c4d/vote"},
+		{http.MethodDelete, "/api/v1/community/posts/8b1c2d3e-4f50-4a6b-8c7d-9e0f1a2b3c4d"},
+		{http.MethodDelete, "/api/v1/community/posts/8b1c2d3e-4f50-4a6b-8c7d-9e0f1a2b3c4d/comments/2c2d3e4f-5061-4b7c-8d9e-0f1a2b3c4d5e"},
 	} {
 		recorder := httptest.NewRecorder()
 		mux.ServeHTTP(recorder, httptest.NewRequest(probe.method, probe.path, nil))

@@ -153,7 +153,15 @@ func main() {
 	mux.Handle("GET /api/v1/community/posts/{postID}", s.authenticated(http.HandlerFunc(s.getCommunityPost)))
 	mux.Handle("POST /api/v1/community/posts/{postID}/vote", s.authenticated(http.HandlerFunc(s.castCommunityVote)))
 	mux.Handle("POST /api/v1/community/posts/{postID}/comments", s.authenticated(http.HandlerFunc(s.createCommunityComment)))
+	mux.Handle("DELETE /api/v1/community/posts/{postID}/comments/{commentID}", s.authenticated(http.HandlerFunc(s.deleteCommunityComment)))
+	mux.Handle("DELETE /api/v1/community/posts/{postID}", s.authenticated(http.HandlerFunc(s.deleteCommunityPost)))
 	mux.Handle("GET /api/v1/community/dangerous-numbers", s.authenticated(http.HandlerFunc(s.listDangerousNumbers)))
+	mux.Handle("GET /api/v1/admin/me", s.authenticated(http.HandlerFunc(s.adminRole)))
+	mux.Handle("GET /api/v1/admin/community/posts", s.adminOnly(http.HandlerFunc(s.listCommunityPostsAdmin)))
+	mux.Handle("PATCH /api/v1/admin/community/posts/{postID}/status", s.adminOnly(http.HandlerFunc(s.updateCommunityPostStatus)))
+	mux.Handle("GET /api/v1/admin/community/reports", s.adminOnly(http.HandlerFunc(s.listPhoneReportsAdmin)))
+	mux.Handle("PATCH /api/v1/admin/community/reports/{reportID}/status", s.adminOnly(http.HandlerFunc(s.updatePhoneReportStatus)))
+	mux.Handle("GET /api/v1/admin/stats/desk", s.adminOnly(http.HandlerFunc(s.deskStats)))
 	mux.Handle("GET /internal/v1/health", s.internalAuthenticated(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { writeJSON(w, 200, map[string]string{"status": "ok"}) })))
 	mux.Handle("GET /internal/v1/metrics", s.internalAuthenticated(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"counters": s.metricsSnapshot(), "data_store": s.db.Kind()})
@@ -207,7 +215,10 @@ func (s *server) corsAndSecurity(next http.Handler) http.Handler {
 			w.Header().Set("Vary", "Origin")
 			w.Header().Set("Access-Control-Allow-Credentials", "true")
 			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Activity, X-Request-ID")
-			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+			// PATCH belongs here because the moderation desk writes its decisions with it and DELETE
+			// because an author erases their own post with it; a method missing from this list is
+			// blocked by the browser before the request is ever sent.
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
 			w.Header().Set("Access-Control-Expose-Headers", "Retry-After, X-Request-ID")
 		}
 		if r.Method == http.MethodOptions {
@@ -1193,7 +1204,7 @@ func (s *server) supabase(ctx context.Context, method, path string, body any, be
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	if strings.HasPrefix(path, "/rest/v1/") && method == http.MethodPatch {
+	if strings.HasPrefix(path, "/rest/v1/") && (method == http.MethodPatch || method == http.MethodDelete) {
 		req.Header.Set("Prefer", "return=representation")
 	} else if strings.HasPrefix(path, "/rest/v1/") && method == http.MethodPost {
 		req.Header.Set("Prefer", "return=minimal")
@@ -1208,7 +1219,15 @@ func (s *server) supabase(ctx context.Context, method, path string, body any, be
 		return err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("supabase returned status %d", resp.StatusCode)
+		// PostgREST puts the database's own complaint in the body, and it is the only place the
+		// reason exists: a bare status turns "the function is not in the schema cache" and "the
+		// function raised on line 40" into the same 500 on the console. Truncated because a failed
+		// select can answer with rows, and never logged here — callers answer clients with a code.
+		snippet := strings.TrimSpace(string(data))
+		if len(snippet) > 300 {
+			snippet = snippet[:300]
+		}
+		return fmt.Errorf("supabase returned status %d: %s", resp.StatusCode, snippet)
 	}
 	if out != nil && len(data) > 0 {
 		return json.Unmarshal(data, out)
